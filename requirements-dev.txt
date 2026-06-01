@@ -1,0 +1,29 @@
+# Development dependencies for ShivaAI Jarvis
+
+# Code quality and formatting
+ruff==0.1.8
+black==23.12.0
+isort==5.13.2
+mypy==1.7.1
+pyupgrade==3.15.0
+pycln==2.3.0
+pre-commit==3.5.0
+
+# Testing
+pytest==7.4.3
+pytest-cov==4.1.0
+pytest-asyncio==0.21.1
+pytest-mock==3.12.0
+httpx==0.25.1
+
+# Documentation
+mkdocs==1.5.3
+mkdocs-material==9.5.3
+
+# Development utilities
+ipython==8.18.1
+rich==13.7.0
+watchdog==3.0.0
+
+-r services/gateway/requirements-dev.txt
+
