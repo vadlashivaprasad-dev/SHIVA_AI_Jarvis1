@@ -9,6 +9,10 @@ from uuid import uuid4
 
 from fastapi import Header, HTTPException, status
 
+from .errors import AuthenticationError, ErrorCode
+
+
+
 from .config import Settings, get_settings
 from .schemas import UserPublic
 
@@ -70,7 +74,10 @@ def decode_access_token(token: str, settings: Settings | None = None) -> dict[st
     try:
         encoded_header, encoded_payload, encoded_signature = token.split(".", 2)
     except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token") from exc
+        raise AuthenticationError(code=ErrorCode.AUTH_TOKEN_INVALID, message="Invalid token") from exc
+
+
+
 
     signing_input = f"{encoded_header}.{encoded_payload}".encode()
     expected_signature = hmac.new(
@@ -80,13 +87,17 @@ def decode_access_token(token: str, settings: Settings | None = None) -> dict[st
     ).digest()
     actual_signature = _b64decode(encoded_signature)
     if not hmac.compare_digest(expected_signature, actual_signature):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+        raise AuthenticationError(code=ErrorCode.AUTH_TOKEN_INVALID, message="Invalid token")
+
+
 
     payload = json.loads(_b64decode(encoded_payload))
     # Small clock-skew allowance to avoid edge-case failures across nodes/containers.
     leeway_seconds = 10
     if int(payload.get("exp", 0)) < int(datetime.now(timezone.utc).timestamp()) - leeway_seconds:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
+        raise AuthenticationError(code=ErrorCode.AUTH_TOKEN_EXPIRED, message="Token expired")
+
+
     return payload
 
 

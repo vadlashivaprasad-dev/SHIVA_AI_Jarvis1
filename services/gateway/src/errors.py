@@ -319,7 +319,9 @@ async def shivaai_exception_handler(request: Request, exc: ShivaAIException) -> 
         content=response.model_dump_json(exclude_none=True),
         status_code=error_detail.status_code,
         media_type="application/json",
+        headers={"X-Request-ID": error_detail.request_id},
     )
+
 
 
 async def generic_exception_handler(request: Request, exc: Exception) -> Response:

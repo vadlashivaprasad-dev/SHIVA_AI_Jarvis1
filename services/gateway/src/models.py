@@ -17,51 +17,12 @@ from sqlalchemy import (
     Text,
     create_engine,
 )
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship, sessionmaker
-from sqlalchemy.pool import NullPool, QueuePool
+from sqlalchemy.orm import declarative_base, relationship
 
-from .config import get_settings
+from .db import get_db_engine, get_db_session  # re-export for backward compatibility
 
 Base = declarative_base()
 
-
-def get_db_engine():
-    """Create database engine based on environment configuration."""
-    settings = get_settings()
-    
-    # Use NullPool for SQLite in development to avoid threading issues
-    # Use QueuePool for PostgreSQL in production
-    if "postgresql" in settings.database_url:
-        pool_class = QueuePool
-        pool_kwargs = {
-            "pool_size": settings.database_pool_size,
-            "max_overflow": 20,
-            "pool_recycle": settings.database_pool_recycle,
-            "pool_pre_ping": True,  # Test connections before using
-        }
-    else:
-        pool_class = NullPool
-        pool_kwargs = {}
-    
-    engine = create_engine(
-        settings.database_url,
-        echo=settings.database_echo,
-        poolclass=pool_class,
-        **pool_kwargs,
-    )
-    
-    return engine
-
-
-def get_db_session():
-    """Create database session factory."""
-    engine = get_db_engine()
-    return sessionmaker(
-        autocommit=False,
-        autoflush=False,
-        bind=engine,
-    )
 
 
 # Models
@@ -134,8 +95,9 @@ class Conversation(Base):
     title = Column(String(255), nullable=False)
     system_prompt = Column(Text)
     model = Column(String(100))
-    metadata = Column(JSON, default=dict)
+    metadata_json = Column("metadata", JSON, default=dict)
     created_at = Column(
+
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
         nullable=False,
@@ -165,8 +127,9 @@ class Message(Base):
     conversation_id = Column(String(36), ForeignKey("conversations.id"), nullable=False)
     role = Column(String(20), nullable=False)  # "user" or "assistant"
     content = Column(Text, nullable=False)
-    metadata = Column(JSON, default=dict)
+    metadata_json = Column("metadata", JSON, default=dict)
     created_at = Column(
+
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
         nullable=False,
@@ -192,8 +155,9 @@ class MemoryEntry(Base):
     source = Column(String(100), nullable=False)
     embedding_vector = Column(String(50000))  # Stored as JSON for simplicity
     relevance_score = Column(String(10))
-    metadata = Column(JSON, default=dict)
+    metadata_json = Column("metadata", JSON, default=dict)
     created_at = Column(
+
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
         nullable=False,
@@ -221,7 +185,8 @@ class Document(Base):
     source = Column(String(500), nullable=False)
     file_path = Column(String(500))
     file_type = Column(String(50))
-    metadata = Column(JSON, default=dict)
+    metadata_json = Column("metadata", JSON, default=dict)
+
     created_at = Column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
@@ -246,8 +211,9 @@ class DocumentChunk(Base):
     chunk_index = Column(String(10), nullable=False)
     content = Column(Text, nullable=False)
     embedding_vector = Column(String(50000))  # Qdrant will store actual vectors
-    metadata = Column(JSON, default=dict)
+    metadata_json = Column("metadata", JSON, default=dict)
     created_at = Column(
+
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
         nullable=False,

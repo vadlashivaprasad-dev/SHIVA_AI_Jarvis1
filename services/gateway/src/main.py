@@ -1,4 +1,4 @@
-onimport sqlite3
+import sqlite3
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -532,6 +532,25 @@ def create_app() -> FastAPI:
     app.add_exception_handler(ShivaAIException, shivaai_exception_handler)
     app.add_exception_handler(Exception, generic_exception_handler)
 
+    @app.exception_handler(404)
+    async def not_found_handler(request: Request, exc: Any) -> JSONResponse:
+        # FastAPI's 404 does not go through the exception handlers above; provide
+        # the structured error contract expected by tests.
+        request_id = getattr(request.state, "request_id", None) or str(uuid4())
+        return JSONResponse(
+            status_code=404,
+            content={
+                "code": "RES_001",
+                "message": "Resource not found",
+                "severity": "error",
+                "request_id": request_id,
+                "timestamp": now_iso(),
+                "status_code": 404,
+                "user_message": "Not Found",
+            },
+        )
+
+
     # Add middleware (order matters)
     # Request ID needs to be early so downstream logging/handlers can access it
     app.add_middleware(RequestIDMiddleware)
@@ -567,11 +586,10 @@ def create_app() -> FastAPI:
     # CSRF protection for state-changing methods
     app.add_middleware(CSRFTokenMiddleware)
 
-    return app
-
 
 
     @app.on_event("startup")
+
     async def startup_event():
         """Initialize services on startup"""
         app_logger = structlog.get_logger("gateway")
@@ -602,6 +620,7 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     @app.get("/api/v1/health")
+
     async def health() -> dict:
         return {
             "status": "healthy",
@@ -736,10 +755,6 @@ def create_app() -> FastAPI:
 
         conversation = repository.get_conversation(payload.conversation_id)
 
-    @app.post("/api/v1/chat/completions")
-    async def send_message(payload: MessageRequest) -> Message:
-        require_module("chat")
-        conversation = repository.get_conversation(payload.conversation_id)
         if conversation is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
 
