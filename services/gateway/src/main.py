@@ -1,5 +1,6 @@
 import sqlite3
 from datetime import datetime, timezone
+from typing import Any
 from uuid import uuid4
 
 import structlog
@@ -555,8 +556,10 @@ def create_app() -> FastAPI:
     # Request ID needs to be early so downstream logging/handlers can access it
     app.add_middleware(RequestIDMiddleware)
     app.add_middleware(LoggingMiddleware)
-    app.add_middleware(CORSMiddleware,
+    app.add_middleware(
+        CORSMiddleware,
         allow_origins=settings.cors_origins,
+        # Required for browsers to send credentials/auth headers
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -578,9 +581,11 @@ def create_app() -> FastAPI:
     app.add_middleware(SecurityHeadersMiddleware)
 
     # Rate limiting (in-memory stopgap; replace with Redis when distributed cache is used)
+    # Rate limiting is intentionally permissive in dev to prevent the UI from tripping 429
+    # during initial page load bursts (multiple parallel GETs + OPTIONS preflights).
     app.add_middleware(
         RateLimitMiddleware,
-        requests_per_minute=60,
+        requests_per_minute=1000,
     )
 
     # CSRF protection for state-changing methods
@@ -593,9 +598,9 @@ def create_app() -> FastAPI:
     async def startup_event():
         """Initialize services on startup"""
         app_logger = structlog.get_logger("gateway")
+        # structlog's bound logger expects keyword args; using `event=` once avoids duplicate arg binding
         app_logger.info(
             "application_startup",
-            event="startup",
             app_name=settings.app_name,
             version=settings.app_version,
         )
@@ -858,9 +863,14 @@ def create_app() -> FastAPI:
         async def events():
             # SSE keep-alive/comment so proxies establish the stream.
             yield ": stream-start\n\n"
+            # Emit already-generated assistant content as SSE tokens.
             for word in assistant_message.content.split():
                 yield sse_chunk("token", f"{word} ")
+
+            # Frontend expects `event: done` and reads the JSON payload from `data:`.
             yield sse_chunk("done", assistant_message.model_dump_json())
+
+
 
         headers = {
             "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",

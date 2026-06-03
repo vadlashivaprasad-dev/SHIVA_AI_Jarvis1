@@ -6,6 +6,7 @@ from .config import Settings
 from .schemas import Message
 
 
+
 @dataclass
 class LLMResult:
     content: str
@@ -133,7 +134,78 @@ class OpenAICompatibleProvider:
         )
 
 
+class OllamaProvider:
+    name = "ollama"
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+
+    async def generate(
+        self,
+        prompt: str,
+        history: list[Message],
+        memories: list[str] | None = None,
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> LLMResult:
+        base_url = getattr(self.settings, "ollama_base_url", "http://localhost:11434")
+        ollama_model = model or getattr(self.settings, "ollama_model", "llama3")
+
+        messages = []
+        for m in history:
+            if m.role not in {"system", "user", "assistant"}:
+                continue
+            messages.append({"role": m.role, "content": m.content})
+
+        if memories:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": "Relevant user memory:\n" + "\n".join(f"- {item}" for item in memories[:8]),
+                }
+            )
+
+        messages.append({"role": "user", "content": prompt})
+
+        # Ollama `/api/chat` accepts: model, messages, stream.
+        payload: dict = {
+            "model": ollama_model,
+            "messages": messages,
+            "stream": False,
+        }
+        if temperature is not None:
+            payload["options"] = {"temperature": temperature}
+        if max_tokens is not None:
+            payload.setdefault("options", {})["num_predict"] = max_tokens
+
+        async with httpx.AsyncClient(timeout=self.settings.llm_timeout_seconds) as client:
+            response = await client.post(
+                f"{base_url.rstrip('/')}/api/chat",
+                json=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        # Response format: {"message": {"role": "assistant", "content": "..."}, ...}
+        content = (data.get("message") or {}).get("content")
+        if not isinstance(content, str):
+            content = str(content or "")
+
+        return LLMResult(
+            content=content,
+            metadata={
+                "provider": self.name,
+                "model": data.get("model", ollama_model),
+            },
+        )
+
+
 def create_llm_provider(settings: Settings):
-    if settings.llm_provider.lower() == "openai":
+    provider = settings.llm_provider.lower()
+    if provider == "openai":
         return OpenAICompatibleProvider(settings)
+    if provider == "ollama":
+        return OllamaProvider(settings)
     return LocalAssistantProvider()
+

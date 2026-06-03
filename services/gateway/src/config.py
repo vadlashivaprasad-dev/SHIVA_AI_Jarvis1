@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     llm_provider: str = Field(default="local", alias="LLM_PROVIDER")
     llm_timeout_seconds: float = Field(default=45.0, alias="LLM_TIMEOUT_SECONDS")
     llm_max_retries: int = Field(default=3, alias="LLM_MAX_RETRIES")
+
+    # Ollama configuration (open-source local LLMs)
+    ollama_base_url: str = Field(default="http://localhost:11434", alias="OLLAMA_BASE_URL")
+    ollama_model: str = Field(default="llama3", alias="OLLAMA_MODEL")
+
     
     # OpenAI configuration
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")

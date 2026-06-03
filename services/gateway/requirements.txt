@@ -7,7 +7,7 @@ pydantic-settings==2.4.0
 # Database
 sqlalchemy==2.0.23
 alembic==1.12.1
-psycopg2-binary==2.9.9
+psycopg2-binary==2.9.12
 
 # Caching and queuing
 redis==5.0.1
@@ -27,7 +27,7 @@ passlib[bcrypt]==1.7.4
 cryptography==41.0.7
 
 # Vector databases
-qdrant-client==2.4.0
+qdrant-client==1.18.0
 
 # Graph databases
 neo4j==5.15.0

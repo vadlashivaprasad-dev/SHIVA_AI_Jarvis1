@@ -983,13 +983,31 @@ export default function App() {
           }
 
           if (sseEvent.eventType === 'done') {
-            const assistantMessage = JSON.parse(sseEvent.data)
-            speak(assistantMessage.content)
-            setMessages((current) =>
-              updateMessage(current, streamingMessageId, () => ({
-                id: assistantMessage.id,
+            // The stream already accumulated the visible assistant text via `token` events.
+            // Some gateways/proxies may send a non-JSON or split/escaped payload for `done`.
+            // To ensure the user always sees the correct reply, we never overwrite the
+            // assembled `content` with the `done` payload.
+            let assistantMessage: any = null
+            try {
+              assistantMessage = JSON.parse(sseEvent.data)
+            } catch {
+              assistantMessage = {
+                id: streamingMessageId,
                 role: 'assistant',
-                content: assistantMessage.content,
+                content: String(sseEvent.data ?? ''),
+              }
+            }
+
+            if (typeof assistantMessage?.content === 'string' && assistantMessage.content.trim().length > 0) {
+              speak(assistantMessage.content)
+            }
+
+            setMessages((current) =>
+              updateMessage(current, streamingMessageId, (message) => ({
+                ...message,
+                id: assistantMessage?.id ?? streamingMessageId,
+                role: 'assistant',
+                // Keep `message.content` built from token events.
                 isStreaming: false,
               })),
             )
