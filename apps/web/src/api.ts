@@ -77,11 +77,12 @@ export class ApiClient {
     return this.request<T>(endpoint, { method: 'DELETE' })
   }
 
-  // Streaming responses for chat
+  // Streaming responses for chat (SSE)
   async stream(
     endpoint: string,
     onChunk: (chunk: string) => void,
-    onError: (error: string) => void
+    onError: (error: string) => void,
+    body?: Record<string, any>
   ): Promise<void> {
     const url = `${API_URL}${endpoint}`
 
@@ -89,11 +90,14 @@ export class ApiClient {
       const response = await fetch(url, {
         method: 'POST',
         headers: this.getHeaders(),
+        body: body ? JSON.stringify(body) : undefined,
       })
 
       if (!response.ok) {
-        const error = await response.json()
-        onError(error.user_message || error.message)
+        // Preserve structured gateway error fields (e.g., code=RES_001)
+        const error = (await response.json()) as Partial<ApiError> | any
+        const payload = typeof error === 'object' && error ? error : { message: String(error) }
+        onError(JSON.stringify(payload))
         return
       }
 
@@ -108,14 +112,22 @@ export class ApiClient {
         if (done) break
 
         buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split('\n\n')
-        buffer = lines.pop() || ''
+        const blocks = buffer.split('\n\n')
+        buffer = blocks.pop() || ''
 
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const data = line.slice(6)
-            if (data) onChunk(data)
+        for (const block of blocks) {
+          const lines = block.split('\n').map((l) => l.trimEnd())
+          const eventLine = lines.find((l) => l.startsWith('event: '))
+          const dataLine = lines.find((l) => l.startsWith('data: '))
+          const event = eventLine ? eventLine.slice(7) : undefined
+          const data = dataLine ? dataLine.slice(6) : undefined
+
+          if (!data) continue
+          if (event === 'token') {
+            onChunk(data)
           }
+
+          // We ignore `done` payload here; Chat component finalizes on stream completion.
         }
       }
     } catch (error) {
@@ -125,3 +137,4 @@ export class ApiClient {
 }
 
 export const apiClient = new ApiClient()
+

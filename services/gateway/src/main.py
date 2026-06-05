@@ -17,6 +17,8 @@ from .logging import RequestIDMiddleware, LoggingMiddleware, configure_logging
 from .auth import create_access_token, get_bearer_payload, hash_password, require_role, verify_password
 from .capabilities import execute_capability
 from .config import get_settings
+from .db import shutdown_db_engine
+
 from .llm import create_llm_provider
 from .schemas import (
     AssistantProfile,
@@ -613,6 +615,9 @@ def create_app() -> FastAPI:
             "application_shutdown",
             event="shutdown",
         )
+        # Ensure SQLAlchemy connection pools are disposed.
+        shutdown_db_engine()
+
 
     @app.get("/")
     async def root() -> dict:
@@ -858,7 +863,9 @@ def create_app() -> FastAPI:
 
     @app.post("/api/v1/chat/completions/stream")
     async def stream_message(payload: MessageRequest) -> StreamingResponse:
+        # Ensure we always stream a valid message payload.
         assistant_message = await send_message(payload)
+
 
         async def events():
             # SSE keep-alive/comment so proxies establish the stream.

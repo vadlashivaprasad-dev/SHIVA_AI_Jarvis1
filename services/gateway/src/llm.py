@@ -168,29 +168,60 @@ class OllamaProvider:
 
         messages.append({"role": "user", "content": prompt})
 
-        # Ollama `/api/chat` accepts: model, messages, stream.
+        # Prefer Ollama /api/chat, but fall back to /api/generate for older versions.
         payload: dict = {
             "model": ollama_model,
             "messages": messages,
             "stream": False,
         }
+
         if temperature is not None:
             payload["options"] = {"temperature": temperature}
         if max_tokens is not None:
             payload.setdefault("options", {})["num_predict"] = max_tokens
 
         async with httpx.AsyncClient(timeout=self.settings.llm_timeout_seconds) as client:
-            response = await client.post(
-                f"{base_url.rstrip('/')}/api/chat",
-                json=payload,
-            )
-            response.raise_for_status()
-            data = response.json()
+            try:
+                response = await client.post(
+                    f"{base_url.rstrip('/')}/api/chat",
+                    json=payload,
+                )
+                if response.status_code == 404:
+                    raise httpx.HTTPStatusError(
+                        "Ollama /api/chat not found",
+                        request=response.request,
+                        response=response,
+                    )
+                response.raise_for_status()
+                data = response.json()
+            except httpx.HTTPStatusError:
+                # Fallback: /api/generate expects prompt, not messages.
+                prompt = "\n".join(m.get("content", "") for m in messages)
+                gen_payload: dict = {
+                    "model": ollama_model,
+                    "prompt": prompt,
+                    "stream": False,
+                }
+                if temperature is not None:
+                    gen_payload["options"] = {"temperature": temperature}
+                if max_tokens is not None:
+                    gen_payload.setdefault("options", {})["num_predict"] = max_tokens
 
+                response = await client.post(
+                    f"{base_url.rstrip('/')}/api/generate",
+                    json=gen_payload,
+                )
+                response.raise_for_status()
+                data = response.json()
+
+
+        # Ollama also supports "generate" API; if /api/chat is not available,
+        # this code path should be reached only when /api/chat returns success.
         # Response format: {"message": {"role": "assistant", "content": "..."}, ...}
         content = (data.get("message") or {}).get("content")
         if not isinstance(content, str):
             content = str(content or "")
+
 
         return LLMResult(
             content=content,

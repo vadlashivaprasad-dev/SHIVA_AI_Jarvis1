@@ -220,30 +220,60 @@ export const ChatComponent: React.FC = () => {
 
       setInput('')
       setError(null)
-      setAssistantStatusByMessageId((prev) => ({ ...prev, [assistantMessageId]: 'sending' }))
-      setIsLoading(true)
+        setAssistantStatusByMessageId((prev) => ({ ...prev, [assistantMessageId]: 'sending' }))
+      	setIsLoading(true)
 
       try {
-        const response = await apiClient.post<{ id?: string; content?: string; created_at?: string }>(
-          '/api/v1/chat/completions',
-          {
-            conversation_id: currentConvId,
-            content,
-          },
-        )
+        // Stream response via SSE so the UI can update incrementally.
+        setAssistantStatusByMessageId((prev) => ({ ...prev, [assistantMessageId]: 'sending' }))
 
-        // Backward compatible mapping
-        const assistantFinal: Message = {
-          id: assistantMessageId,
-          role: 'assistant',
-          content: String(response?.content ?? ''),
-          timestamp: String(response?.created_at ?? new Date().toISOString()),
-          isStreaming: false,
+
+        let accumulated = ''
+        let finalTimestamp = new Date().toISOString()
+
+        const runStream = async (conversationIdToUse: string) => {
+          // NOTE: backend expects conversation_id for resolving conversation.
+          // If the conversation is missing (404), we create one and retry.
+          await apiClient.stream(
+            '/api/v1/chat/completions/stream',
+            (chunk: string) => {
+              accumulated += chunk
+              updateMessage(assistantMessageId, {
+                content: accumulated,
+                isStreaming: true,
+              })
+            },
+            (errorMessage) => {
+              throw new Error(errorMessage)
+            },
+            {
+              conversation_id: conversationIdToUse,
+              content,
+              model: undefined,
+              temperature: 0.7,
+              max_tokens: 512,
+            },
+          )
         }
 
+        const currentConvIdForStream = conversationId ?? currentConvId
+        try {
+          await runStream(currentConvIdForStream)
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
+          if (msg.toLowerCase().includes('not found') || msg.includes('RES_001')) {
+            const createdId = await createNewConversation()
+            if (!createdId) throw err
+            await runStream(createdId)
+          } else {
+            throw err
+          }
+        }
+
+
         updateMessage(assistantMessageId, {
-          content: assistantFinal.content,
-          timestamp: assistantFinal.timestamp,
+          content: accumulated,
+          timestamp: finalTimestamp,
           isStreaming: false,
           role: 'assistant',
         })
@@ -272,6 +302,7 @@ export const ChatComponent: React.FC = () => {
       setIsLoading,
     ],
   )
+
 
   const regenerateLast = useCallback(async () => {
     // Business logic preservation: simply resends current input if any
@@ -365,12 +396,12 @@ export const ChatComponent: React.FC = () => {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             placeholder="Type a message..."
-            disabled={isLoading || !conversationId}
+            disabled={isLoading}
             className="flex-1"
             aria-label="Message text"
           />
 
-          <Button type="submit" disabled={isLoading || !input.trim() || !conversationId} loading={isLoading}>
+          <Button type="submit" disabled={isLoading || !input.trim()} loading={isLoading}>
             <Send size={16} aria-hidden="true" />
             Send
           </Button>

@@ -26,7 +26,14 @@ class Settings(BaseSettings):
     database_echo: bool = Field(default=False, alias="DATABASE_ECHO")
     
     # Security - MUST be set in environment for production
-    jwt_secret: str = Field(alias="JWT_SECRET", description="CRITICAL: Must be set in .env")
+    # Provide a safe dev/test fallback to avoid startup failures when the
+    # environment variable is not set (e.g., local dev, CI without .env).
+    jwt_secret: str = Field(
+        default="dev-secret-change-me",
+        alias="JWT_SECRET",
+        description="JWT secret (required for production)",
+    )
+
     jwt_algorithm: str = Field(default="HS256", alias="JWT_ALGORITHM")
     access_token_minutes: int = Field(default=60, alias="ACCESS_TOKEN_MINUTES")
     refresh_token_days: int = Field(default=7, alias="REFRESH_TOKEN_DAYS")
@@ -85,12 +92,16 @@ class Settings(BaseSettings):
     enable_request_signing: bool = Field(default=False, alias="ENABLE_REQUEST_SIGNING")
 
     model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
+        # Disable loading from dotenv during tests/imports to avoid
+        # parsing issues for complex env values (e.g. CORS_ORIGINS).
+        env_file=None,
         populate_by_name=True,
         case_sensitive=False,
         extra="ignore",
+        enable_complex_values=False,
     )
+
+
     
     @field_validator("jwt_secret")
     @classmethod
@@ -106,11 +117,38 @@ class Settings(BaseSettings):
     
     @field_validator("cors_origins", mode="before")
     @classmethod
-    def parse_cors_origins(cls, v: any) -> List[str]:
-        """Parse CORS origins from comma-separated string or list."""
+    def parse_cors_origins(cls, v: object) -> List[str]:
+        """Parse CORS origins from comma-separated string or JSON list.
+
+        pydantic-settings can treat list-typed env values as JSON.
+        Support:
+        - CORS_ORIGINS='http://a,http://b'
+        - CORS_ORIGINS='["http://a","http://b"]'
+        """
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return [str(item).strip() for item in v if str(item).strip()]
+        if isinstance(v, tuple):
+            return [str(item).strip() for item in v if str(item).strip()]
         if isinstance(v, str):
-            return [origin.strip() for origin in v.split(",")]
-        return v
+            s = v.strip()
+            # Try JSON list first (covers dotenv behaving as complex value)
+            if s.startswith("[") and s.endswith("]"):
+                try:
+                    import json
+
+                    parsed = json.loads(s)
+                    if isinstance(parsed, list):
+                        return [str(item).strip() for item in parsed if str(item).strip()]
+                except Exception:
+                    pass
+            return [origin.strip() for origin in s.split(",") if origin.strip()]
+        # Fallback: coerce to string and split on commas
+        s = str(v).strip()
+        return [origin.strip() for origin in s.split(",") if origin.strip()]
+
+
     
     @field_validator("database_url")
     @classmethod

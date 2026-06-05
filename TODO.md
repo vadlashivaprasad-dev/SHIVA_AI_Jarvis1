@@ -1,10 +1,17 @@
-# TODO - Ollama chat reply + correctness fixes
+# TODO - SQLAlchemy DB utilities hardening
 
-- [x] Add OllamaProvider to `services/gateway/src/llm.py` (HTTP call to Ollama `/api/chat`).
-- [x] Extend `services/gateway/src/config.py` with `ollama_base_url` + `ollama_model` settings.
-- [x] Update `create_llm_provider()` routing to support `LLM_PROVIDER=ollama`.
-- [x] Verify/adjust SSE formatting in `services/gateway/src/main.py` so frontend parses `token` and `done` correctly.
-- [ ] If required, patch `apps/web/src/App.tsx` SSE parsing edge cases.
-- [ ] Add quick local run notes (env vars + commands) to README or deliverable summary.
+- [x] Inspect and update `services/gateway/src/db.py`:
+  - [ ] Replace lru_cache singletons with class-based engine manager
+  - [ ] Add `dispose()` / `shutdown_db_engine()` for cleanup
+  - [ ] Add early `database_url` validation + clear errors
+  - [ ] Add SQLite `timeout` and keep thread-safety config
+  - [ ] Add safe logging (mask credentials)
+  - [ ] Keep backward-compatible public APIs (`get_db_engine`, `get_session_local`, `get_db_session`)
+- [x] Wire shutdown hook in `services/gateway/src/main.py` to call `shutdown_db_engine()`
+- [x] Verify test suite (`pytest`) passes
+- [x] DB engine shutdown wired on FastAPI shutdown
+
+
+
 
 

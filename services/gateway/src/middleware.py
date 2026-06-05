@@ -174,12 +174,17 @@ class CSRFTokenMiddleware(BaseHTTPMiddleware):
     # NOTE: This is a stopgap to keep existing API tests functional.
     DISABLE_CSRF_IN_TESTS = True
 
-
-
-    
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        # Hard bypass for CORS preflight.
+        # Return a minimal 200 response directly to avoid any downstream
+        # middleware/route logic generating a 400 for OPTIONS.
+        if request.method == "OPTIONS":
+            return Response(status_code=status.HTTP_200_OK)
+
         if self.DISABLE_CSRF_IN_TESTS:
             return await call_next(request)
+
+
 
         # Check if method requires CSRF protection
 
