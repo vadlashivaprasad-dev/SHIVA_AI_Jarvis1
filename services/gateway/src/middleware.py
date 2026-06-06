@@ -179,7 +179,24 @@ class CSRFTokenMiddleware(BaseHTTPMiddleware):
         # Return a minimal 200 response directly to avoid any downstream
         # middleware/route logic generating a 400 for OPTIONS.
         if request.method == "OPTIONS":
-            return Response(status_code=status.HTTP_200_OK)
+            # Return CORS headers on preflight so browser allows the actual request.
+            settings = get_settings()
+            origin = request.headers.get("origin")
+            allow_origins = settings.cors_origins or []
+
+            allow_origin = origin if (origin and origin in allow_origins) else "*"
+
+            return Response(
+                status_code=status.HTTP_200_OK,
+                headers={
+                    "Access-Control-Allow-Origin": allow_origin,
+                    "Access-Control-Allow-Methods": "*",
+                    "Access-Control-Allow-Headers": "*",
+                    "Access-Control-Allow-Credentials": "true",
+                    "Vary": "Origin",
+                },
+            )
+
 
         if self.DISABLE_CSRF_IN_TESTS:
             return await call_next(request)

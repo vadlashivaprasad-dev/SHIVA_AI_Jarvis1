@@ -1,17 +1,6 @@
-# TODO - SQLAlchemy DB utilities hardening
-
-- [x] Inspect and update `services/gateway/src/db.py`:
-  - [ ] Replace lru_cache singletons with class-based engine manager
-  - [ ] Add `dispose()` / `shutdown_db_engine()` for cleanup
-  - [ ] Add early `database_url` validation + clear errors
-  - [ ] Add SQLite `timeout` and keep thread-safety config
-  - [ ] Add safe logging (mask credentials)
-  - [ ] Keep backward-compatible public APIs (`get_db_engine`, `get_session_local`, `get_db_session`)
-- [x] Wire shutdown hook in `services/gateway/src/main.py` to call `shutdown_db_engine()`
-- [x] Verify test suite (`pytest`) passes
-- [x] DB engine shutdown wired on FastAPI shutdown
-
-
-
-
+# TODO
+- [ ] Inspect frontend for the URL/method used for SSE (apps/web/src/api.ts or related).
+- [ ] Inspect gateway route list in main_sse_fixed_full.py and main_sse_fixed.py.
+- [ ] Fix 404 by aligning frontend request URL/method with existing backend route OR by adding the missing backend route(s).
+- [ ] Run backend tests (pytest) and/or smoke test.
 
