@@ -22,93 +22,101 @@ logger = structlog.get_logger(__name__)
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
+    """Redis-backed fixed-window rate limiting.
+
+    - Uses Redis for distributed limits.
+    - Hashes Authorization bearer tokens with SHA256 before using as a key.
+    - Adds Retry-After header on 429.
+
+    In pytest runs, rate limiting is disabled.
     """
-    Rate limiting middleware with token bucket algorithm.
-    Tracks per-user and per-IP rate limits.
-    """
-    
-    # In production, use Redis for distributed rate limiting
-    _rate_limits: dict[str, list[float]] = defaultdict(list)
-    
+
     def __init__(self, app, requests_per_minute: int = 60):
         super().__init__(app)
         self.requests_per_minute = requests_per_minute
-        # Test stopgap: the test suite performs many sequential requests.
-        # Disable rate limiting when running under pytest.
+        self.window_seconds = 60
+
+        # Test stopgap: disable rate limiting under pytest.
         try:
-            import os
             if os.getenv("PYTEST_CURRENT_TEST") is not None:
                 self.requests_per_minute = 10_000_000
         except Exception:
             pass
 
-        self.window_seconds = 60
-    
+        self._redis = None
+        try:
+            if self.requests_per_minute < 10_000_000:
+                import redis
+
+                settings = get_settings()
+                self._redis = redis.from_url(settings.redis_url, decode_responses=True)
+                self._redis.ping()
+        except Exception:
+            self._redis = None
+
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        # Get rate limit key (prefer user ID, fall back to IP)
         rate_key = self._get_rate_key(request)
-        
-        # Check rate limit
-        if not self._check_rate_limit(rate_key):
-            logger.warning(
-                "rate_limit_exceeded",
-                rate_key=rate_key,
-                method=request.method,
-                path=request.url.path
-            )
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Rate limit exceeded"
-            )
-        
+
+        # Fail open if redis unavailable or rate limiting disabled.
+        if self.requests_per_minute >= 10_000_000 or self._redis is None:
+            return await call_next(request)
+
+        redis_key = f"rate_limit:{rate_key}:window:{self._current_window_id()}"
+
+        try:
+            current = self._redis.incr(redis_key)
+            if current == 1:
+                self._redis.expire(redis_key, self.window_seconds)
+
+            if current > self.requests_per_minute:
+                retry_after = self.window_seconds
+                logger.warning(
+                    "rate_limit_exceeded",
+                    rate_key=rate_key,
+                    method=request.method,
+                    path=request.url.path,
+                    count=current,
+                    limit=self.requests_per_minute,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Rate limit exceeded",
+                    headers={"Retry-After": str(retry_after)},
+                )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error("rate_limit_redis_error", error=str(exc))
+
         response = await call_next(request)
-        
-        # Add rate limit headers
-        response.headers["X-RateLimit-Limit"] = str(self.requests_per_minute)
-        response.headers["X-RateLimit-Remaining"] = str(
-            self.requests_per_minute - len(self._rate_limits[rate_key])
-        )
-        
+
+        # Best-effort headers.
+        try:
+            current_val = int(self._redis.get(redis_key) or 0)
+            remaining = max(0, self.requests_per_minute - current_val)
+            response.headers["X-RateLimit-Limit"] = str(self.requests_per_minute)
+            response.headers["X-RateLimit-Remaining"] = str(remaining)
+        except Exception:
+            pass
+
         return response
-    
+
+    def _current_window_id(self) -> int:
+        return int(time.time() // self.window_seconds)
+
     def _get_rate_key(self, request: Request) -> str:
-        """Get rate limit key from request."""
-        # Try to get user ID from token
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
-            try:
-                token = auth_header.replace("Bearer ", "")
-                return f"user:{token[:10]}"  # Use token prefix
-            except Exception:
-                pass
-        
-        # Fall back to IP address
+            token = auth_header.replace("Bearer ", "").strip()
+            if token:
+                import hashlib
+
+                digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+                return f"user:{digest}"
+
         client_host = request.client.host if request.client else "unknown"
         return f"ip:{client_host}"
-    
-    def _check_rate_limit(self, key: str) -> bool:
-        """Check if request is within rate limit."""
-        now = time.time()
-        
-        # Clean old requests outside window
-        self._rate_limits[key] = [
-            ts for ts in self._rate_limits[key]
-            if now - ts < self.window_seconds
-        ]
-        
-        # During tests, allow everything to avoid flaky rate-limiting.
-        # (pytest sets PYTEST_CURRENT_TEST per test function.)
-        if os.getenv("PYTEST_CURRENT_TEST") is not None:
-            self._rate_limits[key].append(now)
-            return True
 
-        # Check if under limit
-        if len(self._rate_limits[key]) < self.requests_per_minute:
-
-            self._rate_limits[key].append(now)
-            return True
-        
-        return False
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -131,23 +139,31 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             "max-age=31536000; includeSubDomains; preload"
         )
         
-        # Content Security Policy
+        # Cross-origin hardening
+        response.headers["Cross-Origin-Resource-Policy"] = "same-site"
+        response.headers["Cross-Origin-Embedder-Policy"] = "require-corp"
+
+        # Content Security Policy (hardened)
+        # Note: nonce-based CSP requires frontend/templates to embed nonce values.
+        # This middleware currently generates a nonce but does not inject it into HTML.
+        # Therefore we only remove 'unsafe-inline' to reduce risk without breaking UI.
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline'; "
-            "style-src 'self' 'unsafe-inline'; "
+            "script-src 'self'; "
+            "style-src 'self'; "
             "img-src 'self' data: https:; "
             "font-src 'self'; "
-            "connect-src 'self' https:"
+            "connect-src 'self' https:; "
+            "base-uri 'self'; "
+            "object-src 'none'"
         )
-        
+
         # Referrer policy
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-        
+
         # Feature policy
-        response.headers["Permissions-Policy"] = (
-            "geolocation=(), microphone=(), camera=()"
-        )
+        response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+
         
         return response
 

@@ -24,7 +24,7 @@ export class ApiClient {
 
   async request<T>(
     endpoint: string,
-    options: RequestInit & { method?: string } = {}
+    options: RequestInit & { method?: string } = {},
   ): Promise<T> {
     const url = `${API_URL}${endpoint}`
     const method = options.method || 'GET'
@@ -82,7 +82,8 @@ export class ApiClient {
     endpoint: string,
     onChunk: (chunk: string) => void,
     onError: (error: string) => void,
-    body?: Record<string, any>
+    body?: Record<string, any>,
+    signal?: AbortSignal,
   ): Promise<void> {
     const url = `${API_URL}${endpoint}`
 
@@ -91,6 +92,7 @@ export class ApiClient {
         method: 'POST',
         headers: this.getHeaders(),
         body: body ? JSON.stringify(body) : undefined,
+        signal,
       })
 
       if (!response.ok) {
@@ -107,6 +109,20 @@ export class ApiClient {
       const decoder = new TextDecoder()
       let buffer = ''
 
+      const handleBlock = (block: string) => {
+        const lines = block.split('\n').map((l) => l.trimEnd())
+        const eventLine = lines.find((l) => l.startsWith('event: '))
+        const event = eventLine ? eventLine.slice(7).trim() : undefined
+
+        const dataLines = lines.filter((l) => l.startsWith('data: '))
+        const data = dataLines
+          .map((l) => l.slice(6))
+          .join('\n')
+          .replace(/\\n/g, '\n')
+
+        return { event, data }
+      }
+
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
@@ -116,21 +132,25 @@ export class ApiClient {
         buffer = blocks.pop() || ''
 
         for (const block of blocks) {
-          const lines = block.split('\n').map((l) => l.trimEnd())
-          const eventLine = lines.find((l) => l.startsWith('event: '))
-          const dataLine = lines.find((l) => l.startsWith('data: '))
-          const event = eventLine ? eventLine.slice(7) : undefined
-          const data = dataLine ? dataLine.slice(6) : undefined
-
+          const { event, data } = handleBlock(block)
           if (!data) continue
+
           if (event === 'token') {
             onChunk(data)
+            continue
           }
 
-          // We ignore `done` payload here; Chat component finalizes on stream completion.
+          if (event === 'done') return
+
+          if (event === 'error') {
+            onError(data)
+            return
+          }
         }
       }
     } catch (error) {
+      // Abort should be silent; caller decides UX.
+      if (error instanceof DOMException && error.name === 'AbortError') return
       onError(error instanceof Error ? error.message : 'Connection error')
     }
   }

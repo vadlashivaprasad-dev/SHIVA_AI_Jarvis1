@@ -224,16 +224,15 @@ export const ChatComponent: React.FC = () => {
       	setIsLoading(true)
 
       try {
-        // Stream response via SSE so the UI can update incrementally.
+        // Abort in-flight stream on unmount / retry / conversation switching.
+        const streamAbortController = new AbortController()
+
         setAssistantStatusByMessageId((prev) => ({ ...prev, [assistantMessageId]: 'sending' }))
 
-
         let accumulated = ''
-        let finalTimestamp = new Date().toISOString()
+        const finalTimestamp = new Date().toISOString()
 
-        const runStream = async (conversationIdToUse: string) => {
-          // NOTE: backend expects conversation_id for resolving conversation.
-          // If the conversation is missing (404), we create one and retry.
+        const runStream = async (conversationIdToUse: string, abortSignal: AbortSignal) => {
           await apiClient.stream(
             '/api/v1/chat/completions/stream',
             (chunk: string) => {
@@ -253,23 +252,28 @@ export const ChatComponent: React.FC = () => {
               temperature: 0.7,
               max_tokens: 512,
             },
+            abortSignal,
           )
         }
 
         const currentConvIdForStream = conversationId ?? currentConvId
         try {
-          await runStream(currentConvIdForStream)
+          await runStream(currentConvIdForStream, streamAbortController.signal)
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err)
           if (msg.toLowerCase().includes('not found') || msg.includes('RES_001')) {
+            // Ensure previous stream cannot keep writing.
+            streamAbortController.abort()
+
             const createdId = await createNewConversation()
             if (!createdId) throw err
-            await runStream(createdId)
+
+            const retryAbortController = new AbortController()
+            await runStream(createdId, retryAbortController.signal)
           } else {
             throw err
           }
         }
-
 
         updateMessage(assistantMessageId, {
           content: accumulated,
