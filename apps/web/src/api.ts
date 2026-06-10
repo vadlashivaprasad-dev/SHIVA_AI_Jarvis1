@@ -1,7 +1,7 @@
 // API client with proper error handling and request/response management
 import { useAppStore } from './store'
 
-const DEFAULT_API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+const DEFAULT_API_URL = import.meta.env.VITE_API_URL || ''
 const API_URL = DEFAULT_API_URL.replace(/\/$/, '')
 
 export interface ApiError {
@@ -77,7 +77,7 @@ export class ApiClient {
     return this.request<T>(endpoint, { method: 'DELETE' })
   }
 
-  // Streaming responses for chat (SSE)
+  // Streaming responses for chat (SSE/legacy JSON)
   async stream(
     endpoint: string,
     onChunk: (chunk: string) => void,
@@ -96,7 +96,6 @@ export class ApiClient {
       })
 
       if (!response.ok) {
-        // Preserve structured gateway error fields (e.g., code=RES_001)
         const error = (await response.json()) as Partial<ApiError> | any
         const payload = typeof error === 'object' && error ? error : { message: String(error) }
         onError(JSON.stringify(payload))
@@ -107,10 +106,27 @@ export class ApiClient {
       if (!reader) throw new Error('No response body')
 
       const decoder = new TextDecoder()
-      let buffer = ''
 
-      const handleBlock = (block: string) => {
-        const lines = block.split('\n').map((l) => l.trimEnd())
+      // SSE parsing buffer
+      let sseBuffer = ''
+
+      // Legacy raw JSON parsing buffer: expects concatenated JSON objects that represent tokens.
+      // Example: {"text":"I can "}{"text":"help "}{"text":"you"}
+      let jsonBuffer = ''
+
+      // Extract complete SSE frames from sseBuffer.
+      // We only process parts ending with double newline delimiter.
+      const tryExtractSseFrames = (emitFrame: (frame: string) => void) => {
+        const parts = sseBuffer.split('\n\n')
+        sseBuffer = parts.pop() || ''
+        for (const frame of parts) {
+          if (frame.trim().length === 0) continue
+          emitFrame(frame)
+        }
+      }
+
+      const parseSseFrame = (frame: string): { event?: string; data?: string } => {
+        const lines = frame.split('\n').map((l) => l.trimEnd())
         const eventLine = lines.find((l) => l.startsWith('event: '))
         const event = eventLine ? eventLine.slice(7).trim() : undefined
 
@@ -123,33 +139,123 @@ export class ApiClient {
         return { event, data }
       }
 
+      // Extract complete JSON objects from jsonBuffer.
+      // Uses a lightweight brace matcher that respects strings/escapes.
+      const tryExtractJsonObjects = (): void => {
+        while (true) {
+          const start = jsonBuffer.indexOf('{')
+          if (start === -1) {
+            jsonBuffer = ''
+            return
+          }
+
+          let depth = 0
+          let inString = false
+          let escape = false
+          let end = -1
+
+          for (let i = start; i < jsonBuffer.length; i++) {
+            const ch = jsonBuffer[i]
+
+            if (inString) {
+              if (escape) {
+                escape = false
+              } else if (ch === '\\') {
+                escape = true
+              } else if (ch === '"') {
+                inString = false
+              }
+              continue
+            }
+
+            if (ch === '"') {
+              inString = true
+              continue
+            }
+
+            if (ch === '{') depth++
+            else if (ch === '}') {
+              depth--
+              if (depth === 0) {
+                end = i
+                break
+              }
+            }
+          }
+
+          if (end === -1) return // incomplete trailing fragment
+
+          const objStr = jsonBuffer.slice(start, end + 1)
+          jsonBuffer = jsonBuffer.slice(end + 1)
+
+          try {
+            const parsed = JSON.parse(objStr)
+            const text = typeof parsed?.text === 'string' ? parsed.text : undefined
+            const content = typeof parsed?.content === 'string' ? parsed.content : undefined
+
+            if (typeof text === 'string') onChunk(text)
+            else if (typeof content === 'string') onChunk(content)
+          } catch {
+            // Malformed JSON: stop extracting to avoid passing raw payload.
+            // Keep remaining buffer as-is and wait for more data.
+            // (If it never becomes valid, the stream will finish; UI will show fallback error.)
+            return
+          }
+        }
+      }
+
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
 
-        buffer += decoder.decode(value, { stream: true })
-        const blocks = buffer.split('\n\n')
-        buffer = blocks.pop() || ''
+        const incoming = decoder.decode(value, { stream: true })
 
-        for (const block of blocks) {
-          const { event, data } = handleBlock(block)
-          if (!data) continue
+        // Update buffers
+        sseBuffer += incoming
+        jsonBuffer += incoming
 
-          if (event === 'token') {
-            onChunk(data)
-            continue
-          }
+        // SSE frames
+        tryExtractSseFrames((frame) => {
+          const { event, data } = parseSseFrame(frame)
+          if (!data) return
 
-          if (event === 'done') return
+          // Stop marker
+          if (data.trim() === '[DONE]') return
 
           if (event === 'error') {
             onError(data)
             return
           }
-        }
+
+          if (event === 'token') {
+            try {
+              const parsed = JSON.parse(data)
+              if (typeof parsed?.text === 'string') onChunk(parsed.text)
+              else if (typeof parsed?.content === 'string') onChunk(parsed.content)
+              else onChunk(data)
+            } catch {
+              onChunk(data)
+            }
+            return
+          }
+
+          // Some backends may not send `event:` line, only data payload.
+          // Treat any JSON in `data` as token payload.
+          try {
+            const parsed = JSON.parse(data)
+            if (typeof parsed?.text === 'string') onChunk(parsed.text)
+            else if (typeof parsed?.content === 'string') onChunk(parsed.content)
+          } catch {
+            // Ignore non-JSON SSE data to avoid showing raw wrappers.
+          }
+        })
+
+        // Legacy raw JSON objects
+        tryExtractJsonObjects()
+
+        // If SSE stream used [DONE] sentinel without an event line, stop will be handled by server closing.
       }
     } catch (error) {
-      // Abort should be silent; caller decides UX.
       if (error instanceof DOMException && error.name === 'AbortError') return
       onError(error instanceof Error ? error.message : 'Connection error')
     }

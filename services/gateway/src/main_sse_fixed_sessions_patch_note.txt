@@ -1,1 +1,0 @@
-Temporary note: adding missing chat session endpoints to main_sse_fixed.py (POST/GET /api/v1/chat/sessions and GET by id) to prevent 404s from frontend Chat.tsx.

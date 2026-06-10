@@ -319,11 +319,21 @@ export default function App() {
     try {
       const response = await fetch(`${API_URL}/api/v1/chat/sessions`)
       const payload = await response.json()
-      setConversations(payload)
+
+      // Gateway returns paginated object: { conversations, total, limit, offset, has_more }
+      // Legacy/other implementations may return an array.
+      if (Array.isArray(payload)) {
+        setConversations(payload)
+      } else if (payload && Array.isArray(payload.conversations)) {
+        setConversations(payload.conversations)
+      } else {
+        setConversations([])
+      }
     } catch {
       setConversations([])
     }
   }
+
 
   async function loadMemories(query = '') {
     try {

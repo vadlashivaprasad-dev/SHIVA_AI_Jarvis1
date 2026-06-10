@@ -196,22 +196,27 @@ class CSRFTokenMiddleware(BaseHTTPMiddleware):
         # middleware/route logic generating a 400 for OPTIONS.
         if request.method == "OPTIONS":
             # Return CORS headers on preflight so browser allows the actual request.
+            # IMPORTANT: FastAPI/CORSMiddleware may not attach headers in all cases due to
+            # middleware/route short-circuiting, so we answer explicitly here.
             settings = get_settings()
             origin = request.headers.get("origin")
-            allow_origins = settings.cors_origins or []
+            req_method = request.headers.get("access-control-request-method", "*")
+            req_headers = request.headers.get("access-control-request-headers", "*")
 
+            allow_origins = settings.cors_origins or []
             allow_origin = origin if (origin and origin in allow_origins) else "*"
 
             return Response(
                 status_code=status.HTTP_200_OK,
                 headers={
                     "Access-Control-Allow-Origin": allow_origin,
-                    "Access-Control-Allow-Methods": "*",
-                    "Access-Control-Allow-Headers": "*",
+                    "Access-Control-Allow-Methods": req_method,
+                    "Access-Control-Allow-Headers": req_headers,
                     "Access-Control-Allow-Credentials": "true",
                     "Vary": "Origin",
                 },
             )
+
 
 
         if self.DISABLE_CSRF_IN_TESTS:

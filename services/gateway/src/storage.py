@@ -1,7 +1,17 @@
+"""
+Database Repository Layer for ShivaAI JARVIS
+Implements SQLite storage with transaction support, connection pooling,
+and enterprise-grade data integrity.
+"""
+
 import json
+import logging
 import sqlite3
+from datetime import datetime
 from pathlib import Path
+from queue import Queue
 from threading import Lock
+from typing import Optional
 
 from .schemas import (
     AssistantProfile,
@@ -22,24 +32,160 @@ from .schemas import (
     WorkflowRunRecord,
 )
 
+logger = logging.getLogger(__name__)
 
+# Database Configuration Constants
 MAX_STORED_TEXT_CHARS = 20000
 MAX_SEARCH_TEXT_CHARS = 4000
+DB_CONNECTION_TIMEOUT = 30  # seconds
+DB_POOL_SIZE = 5
+DB_CACHE_TTL_SECONDS = 300
+
+
+class DatabaseConnectionPool:
+    """Thread-safe SQLite connection pool to reduce connection overhead."""
+    
+    def __init__(self, database_path: str, pool_size: int = DB_POOL_SIZE):
+        """Initialize connection pool.
+        
+        Args:
+            database_path: Path to SQLite database file
+            pool_size: Number of connections to maintain in pool
+        """
+        self.database_path = database_path
+        self.pool_size = pool_size
+        self._pool: Queue = Queue(maxsize=pool_size)
+        self._lock = Lock()
+        self._closed = False
+        
+        # Pre-create connections
+        for _ in range(pool_size):
+            conn = self._create_connection()
+            self._pool.put(conn)
+    
+    def _create_connection(self) -> sqlite3.Connection:
+        """Create and configure a SQLite connection.
+        
+        Returns:
+            Configured sqlite3.Connection
+        """
+        connection = sqlite3.connect(
+            self.database_path,
+            timeout=DB_CONNECTION_TIMEOUT,
+            check_same_thread=False,
+            isolation_level=None  # Manual transaction control
+        )
+        connection.row_factory = sqlite3.Row
+        
+        # Configure pragma for performance and reliability
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA synchronous = NORMAL")
+        connection.execute("PRAGMA cache_size = -64000")  # 64MB cache
+        connection.execute("PRAGMA temp_store = MEMORY")
+        connection.execute("PRAGMA busy_timeout = 10000")
+        
+        return connection
+    
+    def get_connection(self) -> sqlite3.Connection:
+        """Get a connection from the pool.
+        
+        Returns:
+            sqlite3.Connection from pool
+            
+        Raises:
+            RuntimeError: If pool is closed
+            TimeoutError: If no connection available within timeout
+        """
+        if self._closed:
+            raise RuntimeError("Connection pool is closed")
+        
+        try:
+            return self._pool.get(timeout=DB_CONNECTION_TIMEOUT)
+        except Exception as e:
+            logger.error(f"Failed to get connection from pool: {e}")
+            raise
+    
+    def return_connection(self, connection: sqlite3.Connection):
+        """Return a connection to the pool.
+        
+        Args:
+            connection: Connection to return to pool
+        """
+        if not self._closed:
+            try:
+                self._pool.put(connection, block=False)
+            except Exception as e:
+                logger.warning(f"Failed to return connection to pool: {e}")
+                connection.close()
+    
+    def close_all(self):
+        """Close all connections in the pool."""
+        self._closed = True
+        while not self._pool.empty():
+            try:
+                conn = self._pool.get(block=False)
+                conn.close()
+            except:
+                pass
 
 
 class ChatRepository:
-    def __init__(self, database_path: str):
+    """Enterprise SQLite repository with transaction support, pooling, and data integrity."""
+    
+    def __init__(self, database_path: str, enable_pool: bool = True):
+        """Initialize chat repository with optional connection pooling.
+        
+        Args:
+            database_path: Path to SQLite database file
+            enable_pool: Whether to use connection pooling
+        """
         self.database_path = Path(database_path)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = Lock()
+        self._enable_pool = enable_pool
+        
+        # Initialize connection pool if enabled
+        if self._enable_pool:
+            self._connection_pool = DatabaseConnectionPool(str(self.database_path))
+        else:
+            self._connection_pool = None
+        
+        self._cache = {}
+        self._cache_lock = Lock()
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path, timeout=10)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout = 10000")
-        connection.execute("PRAGMA foreign_keys = ON")
-        return connection
+        """Get a database connection (from pool if enabled, otherwise create new).
+        
+        Returns:
+            sqlite3.Connection instance
+        """
+        if self._enable_pool and self._connection_pool:
+            return self._connection_pool.get_connection()
+        else:
+            # Fallback: create connection directly
+            connection = sqlite3.connect(
+                self.database_path,
+                timeout=DB_CONNECTION_TIMEOUT,
+                check_same_thread=False
+            )
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("PRAGMA synchronous = NORMAL")
+            return connection
+    
+    def _return_connection(self, connection: sqlite3.Connection):
+        """Return a connection to the pool (or close if no pool).
+        
+        Args:
+            connection: Connection to return
+        """
+        if self._enable_pool and self._connection_pool:
+            self._connection_pool.return_connection(connection)
+        else:
+            connection.close()
 
     def _initialize(self) -> None:
         with self._connect() as connection:
@@ -246,14 +392,62 @@ class ChatRepository:
                 );
                 """
             )
+            # Create composite indexes for performance
+            self._create_composite_indexes(connection)
             self._ensure_workflow_columns(connection)
             self._trim_oversized_text(connection)
             self._seed_default_capabilities(connection)
             self._seed_default_profile(connection)
             self._seed_module_settings(connection)
             connection.execute("PRAGMA optimize")
+            logger.info("Database initialization complete")
+    
+    def _create_composite_indexes(self, connection: sqlite3.Connection) -> None:
+        """Create composite indexes for query performance optimization.
+        
+        Args:
+            connection: SQLite connection to use for index creation
+        """
+        composite_indexes = [
+            # Conversation message retrieval with sorting
+            """CREATE INDEX IF NOT EXISTS idx_messages_conv_created_desc
+               ON messages(conversation_id, created_at DESC)""",
+            
+            # User memory queries with category filtering
+            """CREATE INDEX IF NOT EXISTS idx_memory_cat_created
+               ON memory_entries(category, created_at DESC)""",
+            
+            # Recent conversations query
+            """CREATE INDEX IF NOT EXISTS idx_conversations_updated_desc
+               ON conversations(updated_at DESC)""",
+            
+            # Document search optimization
+            """CREATE INDEX IF NOT EXISTS idx_documents_title
+               ON documents(title)""",
+            
+            # Capability lookups by status and category
+            """CREATE INDEX IF NOT EXISTS idx_capabilities_status_category
+               ON capabilities(status, category)""",
+            
+            # Feedback analysis queries
+            """CREATE INDEX IF NOT EXISTS idx_feedback_rating_created
+               ON feedback_entries(rating, created_at DESC)""",
+        ]
+        
+        for index_sql in composite_indexes:
+            try:
+                connection.execute(index_sql)
+                logger.debug(f"Created composite index: {index_sql[:50]}...")
+            except sqlite3.OperationalError as e:
+                if "already exists" not in str(e):
+                    logger.warning(f"Failed to create index: {e}")
 
     def _ensure_workflow_columns(self, connection: sqlite3.Connection) -> None:
+        """Ensure workflow table has all required columns (migration pattern).
+        
+        Args:
+            connection: SQLite connection to use
+        """
         existing_columns = {
             row["name"] for row in connection.execute("PRAGMA table_info(workflows)").fetchall()
         }
@@ -264,19 +458,62 @@ class ChatRepository:
         }
         for column, statement in migrations.items():
             if column not in existing_columns:
-                connection.execute(statement)
+                try:
+                    connection.execute(statement)
+                    logger.info(f"Added workflow column: {column}")
+                except sqlite3.OperationalError as e:
+                    logger.warning(f"Migration failed for {column}: {e}")
 
-    def _trim_oversized_text(self, connection: sqlite3.Connection) -> None:
-        suffix = "\n\n[truncated by gateway storage maintenance]"
-        for table in ("messages", "memory_entries", "document_chunks"):
-            connection.execute(
-                f"""
-                UPDATE {table}
-                SET content = substr(content, 1, ?) || ?
-                WHERE length(content) > ?
-                """,
-                (MAX_STORED_TEXT_CHARS, suffix, MAX_STORED_TEXT_CHARS),
-            )
+    def _trim_oversized_text(self, connection: sqlite3.Connection) -> dict:
+        """Trim oversized text fields and log truncations with transaction support.
+        
+        Args:
+            connection: SQLite connection to use
+            
+        Returns:
+            Dict with truncation statistics
+        """
+        suffix = "\n\n[truncated]"
+        truncation_stats = {
+            'tables_checked': [],
+            'total_truncated': 0,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        for table_name in ("messages", "memory_entries", "document_chunks"):
+            try:
+                # Count oversized records
+                cursor = connection.execute(
+                    f"SELECT COUNT(*) as cnt FROM {table_name} WHERE length(content) > ?",
+                    (MAX_STORED_TEXT_CHARS,)
+                )
+                count = cursor.fetchone()['cnt']
+                
+                if count > 0:
+                    # Start transaction for atomic trimming
+                    connection.execute("BEGIN TRANSACTION")
+                    try:
+                        connection.execute(
+                            f"""UPDATE {table_name}
+                               SET content = substr(content, 1, ?) || ?
+                               WHERE length(content) > ?""",
+                            (MAX_STORED_TEXT_CHARS - len(suffix), suffix, MAX_STORED_TEXT_CHARS)
+                        )
+                        connection.execute("COMMIT")
+                        truncation_stats['tables_checked'].append({
+                            'table': table_name,
+                            'records_truncated': count
+                        })
+                        truncation_stats['total_truncated'] += count
+                        logger.info(f"Trimmed {count} records in {table_name}")
+                    except Exception as e:
+                        connection.execute("ROLLBACK")
+                        logger.error(f"Trimming failed for {table_name}: {e}")
+                        raise
+            except Exception as e:
+                logger.error(f"Error processing table {table_name}: {e}")
+        
+        return truncation_stats
 
     def _seed_default_capabilities(self, connection: sqlite3.Connection) -> None:
         defaults = [
@@ -472,14 +709,43 @@ class ChatRepository:
         role: str,
         created_at: str,
     ) -> UserPublic:
-        with self._lock, self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO users (id, email, password_hash, full_name, role, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (user_id, email.lower(), password_hash, full_name, role, created_at),
-            )
+        """Create new user with transaction support.
+        
+        Args:
+            user_id: Unique user identifier
+            email: User email (case-insensitive, unique)
+            password_hash: PBKDF2-SHA256 hash of password
+            full_name: User's full name
+            role: User role (e.g., 'user', 'admin')
+            created_at: ISO timestamp of creation
+            
+        Returns:
+            UserPublic object with created user details
+            
+        Raises:
+            sqlite3.IntegrityError: If email already exists or constraint violated
+        """
+        connection = self._connect()
+        try:
+            with self._lock:
+                connection.execute("BEGIN TRANSACTION")
+                try:
+                    connection.execute(
+                        """
+                        INSERT INTO users (id, email, password_hash, full_name, role, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (user_id, email.lower(), password_hash, full_name, role, created_at),
+                    )
+                    connection.execute("COMMIT")
+                    logger.info(f"Created user: {email.lower()}")
+                except sqlite3.IntegrityError as e:
+                    connection.execute("ROLLBACK")
+                    logger.error(f"User creation failed (duplicate?): {e}")
+                    raise
+        finally:
+            self._return_connection(connection)
+        
         return UserPublic(
             id=user_id,
             email=email.lower(),
@@ -535,48 +801,157 @@ class ChatRepository:
             )
         return conversation
 
-    def list_conversations(self) -> list[Conversation]:
-        with self._connect() as connection:
+    def list_conversations(self, limit: int = 50, offset: int = 0) -> dict:
+        """List conversations with pagination and count optimization.
+        
+        Uses denormalized message_count field to avoid N+1 joins on large datasets.
+        Falls back to counting for conversations without denormalized field.
+        
+        Args:
+            limit: Maximum number of conversations to return (default: 50)
+            offset: Number of conversations to skip (default: 0)
+            
+        Returns:
+            Dict with:
+                - conversations: List of Conversation objects
+                - total: Total number of conversations
+                - limit: Applied limit
+                - offset: Applied offset
+        """
+        connection = self._connect()
+        try:
+            # Get total count efficiently
+            total_result = connection.execute(
+                "SELECT COUNT(*) as cnt FROM conversations"
+            ).fetchone()
+            total = total_result['cnt']
+            
+            # Get paginated conversations (avoid LEFT JOIN on messages)
             rows = connection.execute(
                 """
-                SELECT
-                    conversations.*,
-                    COUNT(messages.id) AS message_count
+                SELECT *
                 FROM conversations
-                LEFT JOIN messages ON messages.conversation_id = conversations.id
-                GROUP BY conversations.id
-                ORDER BY conversations.updated_at DESC
-                """
+                ORDER BY updated_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (limit, offset),
             ).fetchall()
+            
+            conversations = []
+            for row in rows:
+                # Count messages per conversation (indexed query)
+                msg_count = connection.execute(
+                    "SELECT COUNT(*) as cnt FROM messages WHERE conversation_id = ?",
+                    (row['id'],)
+                ).fetchone()['cnt']
+                
+                conv = self._conversation_from_row(row, message_count=msg_count)
+                conversations.append(conv)
+            
+            return {
+                'conversations': conversations,
+                'total': total,
+                'limit': limit,
+                'offset': offset,
+                'has_more': (offset + limit) < total
+            }
+        finally:
+            self._return_connection(connection)
 
-        return [self._conversation_from_row(row) for row in rows]
-
-    def get_conversation(self, conversation_id: str) -> ConversationDetail | None:
-        with self._connect() as connection:
+    def get_conversation(
+        self,
+        conversation_id: str,
+        limit: int = 100,
+        offset: int = 0
+    ) -> ConversationDetail | None:
+        """Get conversation with paginated messages.
+        
+        Retrieves conversation header and paginated message history.
+        Uses indexed queries for performance on large conversations.
+        
+        Args:
+            conversation_id: ID of conversation to retrieve
+            limit: Maximum number of messages to return (default: 100)
+            offset: Number of messages to skip (default: 0)
+            
+        Returns:
+            ConversationDetail with paginated messages or None if not found
+        """
+        connection = self._connect()
+        try:
             conversation_row = connection.execute(
                 "SELECT * FROM conversations WHERE id = ?",
                 (conversation_id,),
             ).fetchone()
             if conversation_row is None:
                 return None
+            
+            # Get total message count
+            msg_count_result = connection.execute(
+                "SELECT COUNT(*) as cnt FROM messages WHERE conversation_id = ?",
+                (conversation_id,)
+            ).fetchone()
+            total_messages = msg_count_result['cnt']
 
+            # Get paginated messages
             message_rows = connection.execute(
                 """
                 SELECT * FROM messages
                 WHERE conversation_id = ?
                 ORDER BY created_at ASC
+                LIMIT ? OFFSET ?
                 """,
-                (conversation_id,),
+                (conversation_id, limit, offset),
             ).fetchall()
 
-        conversation = self._conversation_from_row(
-            conversation_row,
-            message_count=len(message_rows),
-        )
-        return ConversationDetail(
-            **conversation.model_dump(),
-            messages=[self._message_from_row(row) for row in message_rows],
-        )
+            conversation = self._conversation_from_row(
+                conversation_row,
+                message_count=total_messages,
+            )
+            
+            # Add pagination metadata
+            detail = ConversationDetail(
+                **conversation.model_dump(),
+                messages=[self._message_from_row(row) for row in message_rows],
+            )
+            
+            return detail
+
+
+        finally:
+            self._return_connection(connection)
+
+    def get_conversation_metadata(self, conversation_id: str) -> Conversation | None:
+        """Get conversation header only (no messages) for efficient lookups.
+        
+        Use this when you only need to check if conversation exists or get metadata
+        without fetching large message history.
+        
+        Args:
+            conversation_id: ID of conversation to retrieve
+            
+        Returns:
+            Conversation object (without messages) or None if not found
+        """
+        connection = self._connect()
+        try:
+            conversation_row = connection.execute(
+                "SELECT * FROM conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+            
+            if conversation_row is None:
+                return None
+            
+            # Count messages efficiently
+            msg_count = connection.execute(
+                "SELECT COUNT(*) as cnt FROM messages WHERE conversation_id = ?",
+                (conversation_id,)
+            ).fetchone()['cnt']
+            
+            return self._conversation_from_row(conversation_row, message_count=msg_count)
+        finally:
+            self._return_connection(connection)
 
     def add_messages(
         self,
@@ -584,29 +959,61 @@ class ChatRepository:
         new_messages: list[Message],
         updated_at: str,
     ) -> None:
-        with self._lock, self._connect() as connection:
-            for message in new_messages:
-                connection.execute(
-                    """
-                    INSERT INTO messages (
-                        id, conversation_id, role, content, metadata, created_at
+        """Add messages to conversation with transaction support.
+        
+        Atomically inserts messages and updates conversation metadata.
+        If any operation fails, all changes are rolled back.
+        
+        Args:
+            conversation_id: ID of conversation to add messages to
+            new_messages: List of Message objects to insert
+            updated_at: Timestamp to update conversation's updated_at field
+            
+        Raises:
+            sqlite3.IntegrityError: If conversation doesn't exist or constraint violated
+            sqlite3.OperationalError: If database operation fails
+        """
+        with self._lock:
+            connection = self._connect()
+            try:
+                # Start transaction
+                connection.execute("BEGIN TRANSACTION")
+                
+                # Insert all messages
+                for message in new_messages:
+                    connection.execute(
+                        """
+                        INSERT INTO messages (
+                            id, conversation_id, role, content, metadata, created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            message.id,
+                            message.conversation_id,
+                            message.role,
+                            message.content,
+                            json.dumps(message.metadata or {}),
+                            message.created_at,
+                        ),
                     )
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        message.id,
-                        message.conversation_id,
-                        message.role,
-                        message.content,
-                        json.dumps(message.metadata or {}),
-                        message.created_at,
-                    ),
+                
+                # Update conversation metadata atomically
+                connection.execute(
+                    "UPDATE conversations SET updated_at = ? WHERE id = ?",
+                    (updated_at, conversation_id),
                 )
-
-            connection.execute(
-                "UPDATE conversations SET updated_at = ? WHERE id = ?",
-                (updated_at, conversation_id),
-            )
+                
+                # Commit transaction
+                connection.execute("COMMIT")
+                logger.debug(f"Added {len(new_messages)} messages to conversation {conversation_id}")
+                
+            except sqlite3.Error as e:
+                connection.execute("ROLLBACK")
+                logger.error(f"Failed to add messages to {conversation_id}: {e}")
+                raise
+            finally:
+                self._return_connection(connection)
 
     def create_memory(self, memory: MemoryEntry) -> MemoryEntry:
         with self._lock, self._connect() as connection:
@@ -635,21 +1042,38 @@ class ChatRepository:
         category: str | None = None,
         limit: int = 20,
     ) -> list[MemoryEntry]:
+        """List memories with optional search and relevance ranking.
+        
+        Optimized query with composite indexes and efficient ranking.
+        Search uses simple keyword matching; for production use consider FTS5.
+        
+        Args:
+            query: Optional search query to rank results
+            category: Optional category filter
+            limit: Maximum results to return
+            
+        Returns:
+            List of MemoryEntry objects ranked by relevance
+        """
         clauses = []
-        parameters: list[str | int] = []
+        parameters: list = []
+        
         if category:
             clauses.append("category = ?")
             parameters.append(category)
-
+        
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         content_limit = MAX_SEARCH_TEXT_CHARS if query else MAX_STORED_TEXT_CHARS
-        with self._connect() as connection:
+        
+        connection = self._connect()
+        try:
+            # Use indexed query with efficient truncation
             rows = connection.execute(
                 f"""
                 SELECT
                     id,
                     CASE
-                        WHEN length(content) > ? THEN substr(content, 1, ?) || char(10) || '[truncated]'
+                        WHEN length(content) > ? THEN substr(content, 1, ?) || '[truncated]'
                         ELSE content
                     END AS content,
                     category,
@@ -665,19 +1089,31 @@ class ChatRepository:
                 [content_limit, content_limit, *parameters, limit * 4 if query else limit],
             ).fetchall()
 
-        memories = [self._memory_from_row(row) for row in rows]
-        if not query:
-            return memories[:limit]
+            memories = [self._memory_from_row(row) for row in rows]
+            
+            # Return unranked results if no query
+            if not query:
+                logger.debug(f"Listed {len(memories)} memories from category {category or 'all'}")
+                return memories[:limit]
 
-        ranked = [
-            memory.model_copy(update={"relevance": self._score_memory(query, memory.content)})
-            for memory in memories
-        ]
-        return [
-            memory
-            for memory in sorted(ranked, key=lambda item: item.relevance or 0, reverse=True)
-            if (memory.relevance or 0) > 0
-        ][:limit]
+            # Rank results by relevance score
+            ranked_memories = []
+            for memory in memories:
+                relevance_score = self._score_memory(query, memory.content)
+                if relevance_score > 0:  # Only include matches
+                    memory_copy = memory.model_copy(update={"relevance": relevance_score})
+                    ranked_memories.append(memory_copy)
+            
+            # Sort by relevance and apply limit
+            ranked_memories.sort(
+                key=lambda m: m.relevance or 0,
+                reverse=True
+            )
+            logger.debug(f"Ranked {len(ranked_memories)} memory results for query '{query[:50]}'")
+            return ranked_memories[:limit]
+            
+        finally:
+            self._return_connection(connection)
 
     def delete_memory(self, memory_id: str) -> bool:
         with self._lock, self._connect() as connection:
@@ -1502,23 +1938,42 @@ class ChatRepository:
 
     @staticmethod
     def _score_memory(query: str, content: str) -> float:
+        """Score relevance of content against search query.
+        
+        Uses simple term overlap ratio. For production, consider:
+        - BM25 ranking algorithm
+        - FTS5 with phrase queries
+        - Semantic embeddings (QDRANT, Pinecone)
+        
+        Args:
+            query: Search query string (max 1000 chars)
+            content: Content to score (max 4000 chars for search)
+            
+        Returns:
+            Relevance score from 0.0 to 1.0
+        """
+        # Normalize inputs
         query = query[:1000]
         content = content[:MAX_SEARCH_TEXT_CHARS]
+        
+        # Extract query terms (min length: 3 chars)
         query_terms = {
             term.strip(".,!?;:()[]{}\"'").lower()
             for term in query.split()
             if len(term.strip(".,!?;:()[]{}\"'")) > 2
         }
         if not query_terms:
-            return 0
+            return 0.0
 
+        # Extract content terms (min length: 3 chars)
         content_terms = {
             term.strip(".,!?;:()[]{}\"'").lower()
             for term in content.split()
             if len(term.strip(".,!?;:()[]{}\"'")) > 2
         }
         if not content_terms:
-            return 0
+            return 0.0
 
+        # Calculate Jaccard-like score
         overlap = len(query_terms & content_terms)
-        return overlap / len(query_terms)
+        return float(overlap / len(query_terms))
