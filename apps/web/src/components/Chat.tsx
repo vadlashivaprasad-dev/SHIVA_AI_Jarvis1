@@ -4,6 +4,8 @@ import { useAppStore, type Message, type Conversation } from '../store'
 import { apiClient } from '../api'
 import { Button, Input, Skeleton, Alert } from './ui'
 import { Bot, Copy, MessageSquare, Plus, RefreshCw, Send, User, AlertCircle } from 'lucide-react'
+import { Markdown } from './Markdown'
+
 
 type ChatMessageStatus = 'sending' | 'sent' | 'failed'
 
@@ -64,7 +66,10 @@ const MessageBubble = memo(function MessageBubble(props: {
           <div className="flex items-start justify-between gap-3">
             <div className="flex items-center gap-2">
               {isUser ? <User size={16} aria-hidden="true" /> : <Bot size={16} aria-hidden="true" />}
-              <p className="text-sm">{message.content}</p>
+              <div className="text-sm">
+                {isUser ? <span>{message.content}</span> : <Markdown content={message.content} />}
+              </div>
+
             </div>
 
             <button
@@ -186,9 +191,7 @@ export const ChatComponent: React.FC = () => {
     }
   }, [])
 
-  const sendMessage = useCallback(
-    async (e: React.FormEvent) => {
-      e.preventDefault()
+  const doSendMessage = useCallback(async () => {
       const content = input.trim()
       if (!content) return
       if (isLoading) return
@@ -220,8 +223,8 @@ export const ChatComponent: React.FC = () => {
 
       setInput('')
       setError(null)
-        setAssistantStatusByMessageId((prev) => ({ ...prev, [assistantMessageId]: 'sending' }))
-      	setIsLoading(true)
+      setAssistantStatusByMessageId((prev) => ({ ...prev, [assistantMessageId]: 'sending' }))
+      setIsLoading(true)
 
       try {
         // Abort in-flight stream on unmount / retry / conversation switching.
@@ -304,19 +307,27 @@ export const ChatComponent: React.FC = () => {
       updateMessage,
       setError,
       setIsLoading,
-    ],
+    ]
   )
 
+  const sendMessage = useCallback(
+    async (e: React.FormEvent) => {
+      e.preventDefault()
+      await doSendMessage()
+    },
+    [doSendMessage],
+  )
 
   const regenerateLast = useCallback(async () => {
     // Business logic preservation: simply resends current input if any
-    // If there is no input, keep no-op.
     const content = input.trim()
     if (!content) return
-    // Trigger send
+
+    // Trigger send without constructing a fake FormEvent.
     setError(null)
-    await sendMessage({ preventDefault: () => {} } as unknown as React.FormEvent)
-  }, [input, sendMessage, setError])
+    await doSendMessage()
+  }, [input, doSendMessage, setError])
+
 
   const statusByMessage = assistantStatusByMessageId
 

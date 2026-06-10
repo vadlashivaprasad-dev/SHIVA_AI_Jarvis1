@@ -92,11 +92,36 @@ class OpenAICompatibleProvider:
             result.metadata["provider_warning"] = "OPENAI_API_KEY is not configured"
             return result
 
-        messages = [
-            {"role": message.role, "content": message.content}
-            for message in history
-            if message.role in {"system", "user", "assistant"}
-        ]
+        # Sanitize history for OpenAI-compatible function calling.
+        # OpenAI rejects orphaned `tool` messages that must follow an assistant message
+        # with a matching `tool_calls` block.
+        clean_messages: list[dict[str, str]] = []
+
+        pending_tool_expected = False
+        for message in history:
+            role = message.role
+            content = message.content
+
+            if role == "assistant":
+                # We don't have tool_calls in our internal Message schema,
+                # so conservatively assume no pending tool calls.
+                # This still fixes the invalid `tool`-message sequence error.
+                pending_tool_expected = False
+                if role in {"system", "user", "assistant"}:
+                    clean_messages.append({"role": "assistant", "content": content})
+                continue
+
+            if role == "tool":
+                # If there is no preceding assistant tool_calls, drop tool messages.
+                # If later we add tool_calls support, we can safely re-enable this.
+                if pending_tool_expected:
+                    clean_messages.append({"role": "assistant", "content": content})
+                continue
+
+            if role in {"system", "user"}:
+                clean_messages.append({"role": role, "content": content})
+
+        messages = clean_messages
         if memories:
             messages.append(
                 {
