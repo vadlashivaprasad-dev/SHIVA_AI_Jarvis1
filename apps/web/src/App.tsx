@@ -1,208 +1,34 @@
 import React, { useEffect, useRef, useState, type FormEvent } from 'react'
-import type { HealthState } from './types'
+import { apiClient } from './api'
+import { ChatWorkspace } from './components/ChatWorkspace'
+import { normalizeMessages, updateMessage } from './messageUtils'
+import type {
+  AssistantProfile,
+  AuthToken,
+  CapabilityEntry,
+  CapabilityInvocationRecord,
+  ConnectorEntry,
+  Conversation,
+  DecisionEvaluation,
+  DigitalTwin,
+  DocumentEntry,
+  EnterpriseOverview,
+  FeedbackSummary,
+  HealthState,
+  IntelligenceResult,
+  MemoryEntry,
+  Message,
+  ModuleSetting,
+  ReflectionResult,
+  UserPublic,
+  WorkflowEntry,
+  WorkflowRunRecord,
+  WorkspaceTab,
+} from './types'
 
-
-// Message type (kept for reference)
-type Message = {
-  id: string
-  role: 'user' | 'assistant'
-  content: string
-  isStreaming?: boolean
-}
-
-type WorkspaceTab = 'profile' | 'knowledge' | 'kernel' | 'intelligence' | 'settings'
-
-type Conversation = {
-  id: string
-  title: string
-  updated_at: string
-  message_count: number
-}
-
-type MemoryEntry = {
-  id: string
-  content: string
-  category: string
-  source: string
-  relevance?: number
-}
-
-type DocumentEntry = {
-  id: string
-  title: string
-  source: string
-  tags: string[]
-  chunk_count: number
-}
-
-type CoreFeature = {
-  id: string
-  name: string
-  status: string
-  description: string
-  capability_count: number
-}
-
-type CapabilityEntry = {
-  id: string
-  name: string
-  description: string
-  category: string
-  status: string
-  permissions: string[]
-  last_invoked_at?: string
-}
-
-type CapabilityInvocationRecord = {
-  id: string
-  capability_name: string
-  status: string
-  dry_run: boolean
-  created_at: string
-}
-
-type AssistantProfile = {
-  preferred_name?: string
-  communication_style: string
-  response_detail: string
-  domains: string[]
-  preferences: Record<string, unknown>
-}
-
-type FeedbackSummary = {
-  total: number
-  by_rating: Record<string, number>
-  by_category: Record<string, number>
-}
-
-type WorkflowEntry = {
-  id: string
-  name: string
-  trigger: string
-  steps: string[]
-  status: string
-  last_run_at?: string
-}
-
-type WorkflowRunRecord = {
-  id: string
-  workflow_name: string
-  status: string
-  dry_run: boolean
-  created_at: string
-}
-
-type DecisionEvaluation = {
-  recommendation: string
-  confidence_score: number
-  risk_score: number
-  cost_score: number
-  impact_score: number
-  rationale: string[]
-  policy_verdict?: string
-}
-
-type ReflectionResult = {
-  summary: string
-  issues: string[]
-  improvements: string[]
-  quality_score: number
-  policy_verdict?: string
-}
-
-type ConnectorEntry = {
-  id: string
-  provider: string
-  status: string
-  scopes: string[]
-}
-
-type DigitalTwin = {
-  preferred_name?: string | null
-  domains: string[]
-  inferred_work_style: string
-  known_facts: Array<{ subject: string; relation: string; object: string; confidence: number }>
-}
-
-type IntelligenceResult = {
-  title: string
-  details: string[]
-}
-
-type ModuleSetting = {
-  id: string
-  name: string
-  enabled: boolean
-  category: string
-  description: string
-}
-
-type UserPublic = {
-  id: string
-  email: string
-  full_name?: string | null
-  role: string
-  created_at: string
-}
-
-type AuthToken = {
-  access_token: string
-  token_type: string
-  user: UserPublic
-}
-
-const DEFAULT_API_URL = 'http://localhost:8000'
+const DEFAULT_API_URL = ''
 const API_URL = (import.meta.env.VITE_API_URL ?? DEFAULT_API_URL).replace(/\/$/, '')
 const TOKEN_STORAGE_KEY = 'shivaai_access_token'
-
-function parseSseEvents(buffer: string) {
-  const events = buffer.split('\n\n')
-  const remainder = events.pop() ?? ''
-  return {
-    events: events
-      .map((eventBlock) => {
-        const eventType =
-          eventBlock
-            .split('\n')
-            .find((line) => line.startsWith('event: '))
-            ?.replace('event: ', '')
-            .trim() ?? 'message'
-        const data = eventBlock
-          .split('\n')
-          .filter((line) => line.startsWith('data: '))
-          .map((line) => line.replace('data: ', ''))
-          .join('\n')
-          .replace(/\\n/g, '\n')
-        return { eventType, data }
-      })
-      .filter((event) => event.data.length > 0),
-    remainder,
-  }
-}
-
-function readableStreamText(data: string) {
-  if (!data) return ''
-
-  try {
-    const parsed = JSON.parse(data)
-    if (typeof parsed === 'string') return parsed
-    if (typeof parsed?.text === 'string') return parsed.text
-    if (typeof parsed?.content === 'string') return parsed.content
-    if (typeof parsed?.message === 'string') return parsed.message
-  } catch {
-    // Plain text token, already readable.
-  }
-
-  return data
-}
-
-function updateMessage(
-  messages: Message[],
-  messageId: string,
-  update: (message: Message) => Message,
-) {
-  return messages.map((message) => (message.id === messageId ? update(message) : message))
-}
 
 export default function App() {
   const messageListRef = useRef<HTMLDivElement | null>(null)
@@ -251,6 +77,7 @@ export default function App() {
   const [domainPrompt, setDomainPrompt] = useState('Dashboard screen shows an error chart')
   const [intelligenceResult, setIntelligenceResult] = useState<IntelligenceResult | null>(null)
   const [moduleSettings, setModuleSettings] = useState<ModuleSetting[]>([])
+  const [enterpriseOverview, setEnterpriseOverview] = useState<EnterpriseOverview | null>(null)
   const [settingsMessage, setSettingsMessage] = useState('')
   const [feedbackStatus, setFeedbackStatus] = useState<Record<string, string>>({})
   const [feedbackSummary, setFeedbackSummary] = useState<FeedbackSummary>({
@@ -269,7 +96,7 @@ export default function App() {
   const [isListening, setIsListening] = useState(false)
   const [continuousVoice, setContinuousVoice] = useState(false)
   const [autoSpeak, setAutoSpeak] = useState(false)
-  const [activeWorkspace, setActiveWorkspace] = useState<WorkspaceTab>('profile')
+  const [activeWorkspace, setActiveWorkspace] = useState<WorkspaceTab>('command')
   const [voiceStatus, setVoiceStatus] = useState('')
 
   useEffect(() => {
@@ -293,6 +120,7 @@ export default function App() {
     loadProfile()
     loadFeedbackSummary()
     loadModuleSettings()
+    loadEnterpriseOverview()
   }, [])
 
   useEffect(() => {
@@ -313,9 +141,14 @@ export default function App() {
   }, [token, user?.role])
 
   useEffect(() => {
-    messageListRef.current?.scrollTo({
-      top: messageListRef.current.scrollHeight,
-      behavior: 'smooth',
+    const list = messageListRef.current
+    if (!list) return
+
+    requestAnimationFrame(() => {
+      list.scrollTo({
+        top: list.scrollHeight,
+        behavior: isSending ? 'auto' : 'smooth',
+      })
     })
   }, [messages, isSending])
 
@@ -476,6 +309,17 @@ export default function App() {
     }
   }
 
+  async function loadEnterpriseOverview() {
+    try {
+      const response = await fetch(`${API_URL}/api/v1/enterprise/overview`)
+      const payload = await response.json()
+      if (!response.ok) throw new Error(payload.detail ?? 'Unable to load enterprise overview')
+      setEnterpriseOverview(payload)
+    } catch {
+      setEnterpriseOverview(null)
+    }
+  }
+
   function isModuleEnabled(moduleId: string) {
     return moduleSettings.find((setting) => setting.id === moduleId)?.enabled ?? true
   }
@@ -496,6 +340,7 @@ export default function App() {
       setSettingsMessage(`${payload.name} ${payload.enabled ? 'enabled' : 'disabled'}.`)
       loadFeatures()
       loadCapabilities(capabilityQuery)
+      loadEnterpriseOverview()
     } catch (error) {
       setSettingsMessage(error instanceof Error ? error.message : 'Unable to update module')
     }
@@ -587,6 +432,7 @@ export default function App() {
     if (response.ok) {
       setMemoryInput('')
       loadMemories(memoryQuery)
+      loadEnterpriseOverview()
     }
   }
 
@@ -616,6 +462,7 @@ export default function App() {
       setDocumentTags('')
       loadDocuments()
       loadMemories(memoryQuery)
+      loadEnterpriseOverview()
     }
   }
 
@@ -651,6 +498,7 @@ export default function App() {
       setCapabilityDescription('')
       loadCapabilities(capabilityQuery)
       loadFeatures()
+      loadEnterpriseOverview()
     }
   }
 
@@ -667,6 +515,7 @@ export default function App() {
     if (response.ok) {
       loadCapabilities(capabilityQuery)
       loadInvocations()
+      loadEnterpriseOverview()
     }
   }
 
@@ -689,6 +538,7 @@ export default function App() {
       setWorkflowSteps('')
       loadWorkflows()
       loadFeatures()
+      loadEnterpriseOverview()
     }
   }
 
@@ -702,6 +552,7 @@ export default function App() {
     if (response.ok) {
       loadWorkflows()
       loadWorkflowRuns()
+      loadEnterpriseOverview()
     }
   }
 
@@ -759,6 +610,7 @@ export default function App() {
     if (response.ok) {
       setWorldFact('')
       loadDigitalTwin()
+      loadEnterpriseOverview()
     }
   }
 
@@ -786,6 +638,7 @@ export default function App() {
         title: `${connectorId} sync`,
         details: [`${payload.status}: ${payload.records_seen} records`, ...payload.actions],
       })
+      loadEnterpriseOverview()
     }
   }
 
@@ -807,6 +660,7 @@ export default function App() {
       })
       loadCapabilities(capabilityQuery)
       loadFeatures()
+      loadEnterpriseOverview()
     }
   }
 
@@ -880,6 +734,7 @@ export default function App() {
     if (response.ok) {
       setFeedbackStatus((current) => ({ ...current, [message.id]: rating }))
       loadFeedbackSummary()
+      loadEnterpriseOverview()
     }
   }
 
@@ -898,14 +753,32 @@ export default function App() {
       const payload = await response.json()
       setProfile(payload)
       setDomainInput(payload.domains.join(', '))
+      loadEnterpriseOverview()
     }
   }
 
   async function openConversation(id: string) {
-    const response = await fetch(`${API_URL}/api/v1/chat/sessions/${id}`)
-    const payload = await response.json()
-    setConversationId(payload.id)
-    setMessages(payload.messages)
+    try {
+      const response = await fetch(`${API_URL}/api/v1/chat/sessions/${id}`)
+      if (!response.ok) {
+        throw new Error(`Gateway could not load the chat session (${response.status})`)
+      }
+
+      const payload = await response.json()
+      setConversationId(typeof payload.id === 'string' ? payload.id : id)
+      setMessages(normalizeMessages(payload.messages))
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'Unknown gateway error'
+      setConversationId(id)
+      setMessages([
+        {
+          id: `error-${Date.now()}`,
+          role: 'assistant',
+          content: `Could not load this conversation. ${detail}`,
+          isStreaming: false,
+        },
+      ])
+    }
   }
 
   async function startNewConversation() {
@@ -963,99 +836,66 @@ export default function App() {
     }
     setMessages((current) => [...current, localMessage, streamingMessage])
 
+    let visibleAssistantContent = ''
+    let pendingAssistantContent = ''
+    let streamError: Error | null = null
+    let flushFrame: number | null = null
+
+    const flushAssistantContent = () => {
+      flushFrame = null
+      if (!pendingAssistantContent) return
+
+      const nextContent = `${visibleAssistantContent}${pendingAssistantContent}`
+      pendingAssistantContent = ''
+      visibleAssistantContent = nextContent
+      setMessages((current) =>
+        updateMessage(current, streamingMessageId, (message) => ({
+          ...message,
+          content: nextContent,
+        })),
+      )
+    }
+
+    const queueAssistantChunk = (chunk: string) => {
+      pendingAssistantContent += chunk
+      if (flushFrame !== null) return
+      flushFrame = requestAnimationFrame(flushAssistantContent)
+    }
+
     try {
       const id = await ensureConversation(content)
-      const response = await fetch(`${API_URL}/api/v1/chat/completions/stream`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ conversation_id: id, content }),
-      })
+      await apiClient.stream(
+        '/api/v1/chat/completions/stream',
+        queueAssistantChunk,
+        (errorMessage) => {
+          streamError = new Error(errorMessage || 'Streaming failed')
+        },
+        { conversation_id: id, content },
+      )
 
-      if (!response.ok || !response.body) {
-        let detail = `Gateway rejected the message (${response.status})`
-        try {
-          const payload = await response.json()
-          detail = payload.detail ?? detail
-        } catch {
-          // Keep the status-based message when the gateway did not return JSON.
-        }
-        throw new Error(detail)
-      }
+      if (streamError) throw streamError
 
-      const reader = response.body.getReader()
-      const decoder = new TextDecoder()
-      let buffer = ''
-
-      while (true) {
-        const { value, done } = await reader.read()
-        if (done) break
-        buffer += decoder.decode(value, { stream: true })
-        const parsed = parseSseEvents(buffer)
-        buffer = parsed.remainder
-
-        for (const sseEvent of parsed.events) {
-          if (sseEvent.eventType === 'token') {
-            const readableToken = readableStreamText(sseEvent.data)
-            if (!readableToken) continue
-            setMessages((current) =>
-              updateMessage(current, streamingMessageId, (message) => ({
-                ...message,
-                content: `${message.content}${readableToken}`,
-              })),
-            )
-          }
-
-          if (sseEvent.eventType === 'done') {
-            // The stream already accumulated the visible assistant text via `token` events.
-            // Some gateways/proxies may send a non-JSON or split/escaped payload for `done`.
-            // To ensure the user always sees the correct reply, we never overwrite the
-            // assembled `content` with the `done` payload.
-            let assistantMessage: any = null
-            try {
-              assistantMessage = JSON.parse(sseEvent.data)
-            } catch {
-              assistantMessage = {
-                id: streamingMessageId,
-                role: 'assistant',
-                content: readableStreamText(String(sseEvent.data ?? '')),
-              }
-            }
-
-            const finalContent =
-              typeof assistantMessage?.content === 'string'
-                ? assistantMessage.content
-                : readableStreamText(sseEvent.data)
-
-            if (finalContent.trim().length > 0) {
-              speak(finalContent)
-            }
-
-            setMessages((current) =>
-              updateMessage(current, streamingMessageId, (message) => ({
-                ...message,
-                id: assistantMessage?.id ?? streamingMessageId,
-                role: 'assistant',
-                content: message.content || finalContent,
-                isStreaming: false,
-              })),
-            )
-          }
-
-          if (sseEvent.eventType === 'error') {
-            throw new Error(readableStreamText(sseEvent.data) || 'Streaming failed')
-          }
-        }
+      if (flushFrame !== null) {
+        cancelAnimationFrame(flushFrame)
+        flushAssistantContent()
       }
 
       setMessages((current) =>
         updateMessage(current, streamingMessageId, (message) => ({
           ...message,
+          content: visibleAssistantContent || message.content,
           isStreaming: false,
         })),
       )
+      if (visibleAssistantContent.trim().length > 0) {
+        speak(visibleAssistantContent)
+      }
       loadConversations()
       loadMemories(memoryQuery)
     } catch (error) {
+      if (flushFrame !== null) {
+        cancelAnimationFrame(flushFrame)
+      }
       const detail = error instanceof Error ? error.message : 'Unknown gateway error'
       const errorMessage = `Gateway connection failed. ${detail}. Start the gateway with docker compose or uvicorn, then try again.`
       speak(errorMessage)
@@ -1246,111 +1086,38 @@ export default function App() {
         </div>
       </aside>
 
-      <section className="chat-panel" aria-label="Chat workspace">
-        <div className="message-list" ref={messageListRef}>
-          {messages.length === 0 ? (
-            <div className="empty-state">
-              <h2>Ask Jarvis to plan, code, research, or reason.</h2>
-              <p>The frontend is connected to the new gateway service layout.</p>
-            </div>
-          ) : (
-            messages.map((message) => (
-              <article key={message.id} className={`message ${message.role}`}>
-                <strong>{message.role === 'user' ? 'You' : 'Jarvis'}</strong>
-                <p>
-                  {message.content}
-                  {message.isStreaming ? <span className="stream-cursor">|</span> : null}
-                </p>
-                {message.role === 'assistant' ? (
-                  <div className="feedback-actions">
-                    <button
-                      type="button"
-                      disabled={message.isStreaming || Boolean(feedbackStatus[message.id])}
-                      onClick={() => sendFeedback(message, 'positive')}
-                    >
-                      Good
-                    </button>
-                    <button
-                      type="button"
-                      disabled={message.isStreaming || Boolean(feedbackStatus[message.id])}
-                      onClick={() => sendFeedback(message, 'negative')}
-                    >
-                      Fix
-                    </button>
-                    {feedbackStatus[message.id] ? <small>Saved</small> : null}
-                  </div>
-                ) : null}
-              </article>
-            ))
-          )}
-        </div>
-
-        <form className="composer" onSubmit={sendMessage}>
-          <input
-            value={input}
-            onChange={(event) => setInput(event.target.value)}
-            placeholder="Message ShivaAI Jarvis"
-            aria-label="Message ShivaAI Jarvis"
-          />
-          <button
-            className={`voice-button ${isListening ? 'listening' : ''}`}
-            type="button"
-            onClick={toggleVoiceInput}
-            disabled={!isModuleEnabled('voice')}
-            aria-label={isListening ? 'Stop voice input' : 'Start voice input'}
-            title={isListening ? 'Stop voice input' : 'Start voice input'}
-          >
-            {isListening ? 'Stop' : 'Mic'}
-          </button>
-          <button type="submit" disabled={isSending}>
-            {isSending ? 'Sending' : 'Send'}
-          </button>
-        </form>
-        <div className="voice-controls" aria-label="Voice controls">
-          <label>
-            <input
-              type="checkbox"
-              checked={autoSpeak}
-              disabled={!isModuleEnabled('voice')}
-              onChange={(event) => {
-                setAutoSpeak(event.target.checked)
-                if (!event.target.checked) window.speechSynthesis?.cancel()
-              }}
-            />
-            Speak replies
-          </label>
-          <label>
-            <input
-              type="checkbox"
-              checked={continuousVoice}
-              disabled={!isModuleEnabled('voice')}
-              onChange={(event) => setContinuousVoice(event.target.checked)}
-            />
-            Continuous voice
-          </label>
-          <button
-            type="button"
-            onClick={() => {
-              window.speechSynthesis?.cancel()
-              setVoiceStatus('Speech stopped.')
-            }}
-          >
-            Stop audio
-          </button>
-        </div>
-        {voiceStatus ? <p className="voice-status">{voiceStatus}</p> : null}
-      </section>
+      <ChatWorkspace
+        messages={messages}
+        messageListRef={messageListRef}
+        feedbackStatus={feedbackStatus}
+        input={input}
+        isSending={isSending}
+        isListening={isListening}
+        autoSpeak={autoSpeak}
+        continuousVoice={continuousVoice}
+        voiceStatus={voiceStatus}
+        isModuleEnabled={isModuleEnabled}
+        setInput={setInput}
+        setAutoSpeak={setAutoSpeak}
+        setContinuousVoice={setContinuousVoice}
+        setVoiceStatus={setVoiceStatus}
+        sendMessage={sendMessage}
+        toggleVoiceInput={toggleVoiceInput}
+        sendFeedback={sendFeedback}
+      />
 
       <aside className="memory-panel" aria-label="Memory workspace">
         <div className="workspace-tabs" role="tablist" aria-label="Workspace tabs">
-          {(['profile', 'knowledge', 'kernel', 'intelligence', 'settings'] as WorkspaceTab[]).map((tab) => (
+          {(['command', 'profile', 'knowledge', 'kernel', 'intelligence', 'settings'] as WorkspaceTab[]).map((tab) => (
             <button
               key={tab}
               className={activeWorkspace === tab ? 'active' : ''}
               type="button"
               onClick={() => setActiveWorkspace(tab)}
             >
-              {tab === 'profile'
+              {tab === 'command'
+                ? 'Command'
+                : tab === 'profile'
                 ? 'Profile'
                 : tab === 'knowledge'
                   ? 'Knowledge'
@@ -1362,6 +1129,124 @@ export default function App() {
             </button>
           ))}
         </div>
+
+        {activeWorkspace === 'command' ? (
+          <div className="command-section">
+            <div className="command-hero">
+              <div>
+                <p className="eyebrow">Enterprise Command</p>
+                <h2>Operational readiness</h2>
+                <small>
+                  {enterpriseOverview
+                    ? `Generated ${new Date(enterpriseOverview.generated_at).toLocaleTimeString()}`
+                    : 'Waiting for gateway overview'}
+                </small>
+              </div>
+              <div className={`readiness-dial readiness-${enterpriseOverview?.posture ?? 'attention'}`}>
+                <strong>{enterpriseOverview?.readiness_score ?? '--'}</strong>
+                <span>{enterpriseOverview?.posture ?? 'loading'}</span>
+              </div>
+            </div>
+
+            <div className="metric-grid" aria-label="Enterprise metrics">
+              {enterpriseOverview
+                ? [
+                    ['Chats', enterpriseOverview.metrics.conversations],
+                    ['Memory', enterpriseOverview.metrics.memories],
+                    ['Docs', enterpriseOverview.metrics.documents],
+                    ['Flows', enterpriseOverview.metrics.workflows],
+                    ['Runs', enterpriseOverview.metrics.workflow_runs],
+                    ['Caps', enterpriseOverview.metrics.capabilities],
+                    ['Conn', enterpriseOverview.metrics.connectors],
+                    ['Feedback', enterpriseOverview.metrics.feedback],
+                  ].map(([label, value]) => (
+                    <article key={label}>
+                      <span>{label}</span>
+                      <strong>{value}</strong>
+                    </article>
+                  ))
+                : Array.from({ length: 8 }).map((_, index) => (
+                    <article key={index}>
+                      <span>Loading</span>
+                      <strong>--</strong>
+                    </article>
+                  ))}
+            </div>
+
+            <article className="governance-card">
+              <div>
+                <strong>Governance posture</strong>
+                <button type="button" onClick={loadEnterpriseOverview}>
+                  Refresh
+                </button>
+              </div>
+              <div className="governance-bars">
+                <span>
+                  Modules{' '}
+                  <b>
+                    {enterpriseOverview?.governance.enabled_modules ?? 0}/
+                    {enterpriseOverview?.governance.total_modules ?? 0}
+                  </b>
+                </span>
+                <progress
+                  value={enterpriseOverview?.governance.enabled_modules ?? 0}
+                  max={enterpriseOverview?.governance.total_modules || 1}
+                />
+                <span>
+                  Capabilities{' '}
+                  <b>
+                    {enterpriseOverview?.governance.enabled_capabilities ?? 0}/
+                    {enterpriseOverview?.governance.total_capabilities ?? 0}
+                  </b>
+                </span>
+                <progress
+                  value={enterpriseOverview?.governance.enabled_capabilities ?? 0}
+                  max={enterpriseOverview?.governance.total_capabilities || 1}
+                />
+              </div>
+              <small>
+                LLM {enterpriseOverview?.llm.status ?? 'unknown'} via{' '}
+                {enterpriseOverview?.llm.provider ?? 'gateway'}:{' '}
+                {enterpriseOverview?.llm.model ?? 'not loaded'}
+              </small>
+            </article>
+
+            <div className="command-lists">
+              <section>
+                <strong>Risks</strong>
+                {(enterpriseOverview?.risks ?? ['Overview not loaded yet.']).map((risk) => (
+                  <p key={risk}>{risk}</p>
+                ))}
+              </section>
+              <section>
+                <strong>Next actions</strong>
+                {(enterpriseOverview?.next_actions ?? ['Refresh the overview after gateway startup.']).map((action) => (
+                  <p key={action}>{action}</p>
+                ))}
+              </section>
+            </div>
+
+            <div className="activity-feed">
+              <strong>Recent activity</strong>
+              {(enterpriseOverview?.recent_activity ?? []).length > 0 ? (
+                enterpriseOverview?.recent_activity.map((activity) => (
+                  <article key={`${activity.type}-${activity.created_at}-${activity.label}`}>
+                    <span>{activity.label}</span>
+                    <small>
+                      {activity.type} - {activity.status} -{' '}
+                      {new Date(activity.created_at).toLocaleTimeString()}
+                    </small>
+                  </article>
+                ))
+              ) : (
+                <article>
+                  <span>No audited activity yet</span>
+                  <small>Run a capability or workflow to populate the feed.</small>
+                </article>
+              )}
+            </div>
+          </div>
+        ) : null}
 
         {activeWorkspace === 'profile' ? (
           <>

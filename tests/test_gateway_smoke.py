@@ -23,6 +23,23 @@ def test_health_endpoint_is_available():
     assert response.json()["status"] == "healthy"
 
 
+def test_readiness_and_llm_status_endpoints_are_available():
+    readiness_response = client.get("/ready")
+
+    assert readiness_response.status_code == 200
+    readiness = readiness_response.json()
+    assert readiness["status"] in {"ready", "degraded"}
+    assert readiness["checks"]["database"]["status"] == "healthy"
+    assert readiness["checks"]["llm"]["provider"] == "local"
+
+    llm_response = client.get("/api/v1/llm/status")
+
+    assert llm_response.status_code == 200
+    llm = llm_response.json()
+    assert llm["provider"] == "local"
+    assert llm["status"] == "healthy"
+
+
 def test_auth_signup_login_me_and_admin_user_listing():
     email = f"admin-{uuid4()}@example.com"
     signup_response = client.post(
@@ -362,6 +379,20 @@ def test_core_feature_status_endpoint():
     assert response.status_code == 200
     feature_ids = {feature["id"] for feature in response.json()}
     assert {"chat", "memory", "orchestration", "governance", "workflow", "decision"} <= feature_ids
+
+
+def test_enterprise_overview_summarizes_operational_posture():
+    response = client.get("/api/v1/enterprise/overview")
+
+    assert response.status_code == 200
+    overview = response.json()
+    assert overview["posture"] in {"ready", "watch", "attention"}
+    assert 0 <= overview["readiness_score"] <= 100
+    assert overview["llm"]["provider"] == "local"
+    assert overview["metrics"]["capabilities"] >= 1
+    assert overview["governance"]["total_modules"] >= overview["governance"]["enabled_modules"]
+    assert overview["risks"]
+    assert overview["next_actions"]
 
 
 def test_module_settings_can_disable_and_enable_domain_features():

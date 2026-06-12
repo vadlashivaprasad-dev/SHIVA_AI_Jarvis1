@@ -1,8 +1,10 @@
+import asyncio
 from dataclasses import dataclass
 
 import httpx
 
 from .config import Settings
+from .errors import ErrorCode, ExternalServiceError
 from .schemas import Message
 
 
@@ -13,9 +15,25 @@ class LLMResult:
     metadata: dict
 
 
+@dataclass
+class LLMHealth:
+    provider: str
+    status: str
+    model: str
+    details: dict
+
+
 class LocalAssistantProvider:
     name = "local"
     memory_preview_chars = 600
+
+    async def health_check(self) -> LLMHealth:
+        return LLMHealth(
+            provider=self.name,
+            status="healthy",
+            model="local-assistant",
+            details={"mode": "deterministic-fallback"},
+        )
 
     async def generate(
         self,
@@ -76,6 +94,21 @@ class OpenAICompatibleProvider:
 
     def __init__(self, settings: Settings):
         self.settings = settings
+
+    async def health_check(self) -> LLMHealth:
+        if not self.settings.openai_api_key:
+            return LLMHealth(
+                provider=self.name,
+                status="degraded",
+                model=self.settings.openai_model,
+                details={"reason": "OPENAI_API_KEY is not configured; local fallback will be used"},
+            )
+        return LLMHealth(
+            provider=self.name,
+            status="healthy",
+            model=self.settings.openai_model,
+            details={"base_url": self.settings.openai_api_base},
+        )
 
     async def generate(
         self,
@@ -165,6 +198,75 @@ class OllamaProvider:
     def __init__(self, settings: Settings):
         self.settings = settings
 
+    @property
+    def base_url(self) -> str:
+        return self.settings.ollama_base_url.rstrip("/")
+
+    @property
+    def configured_model(self) -> str:
+        return self.settings.ollama_model
+
+    async def health_check(self) -> LLMHealth:
+        try:
+            async with httpx.AsyncClient(timeout=min(self.settings.llm_timeout_seconds, 5.0)) as client:
+                response = await client.get(f"{self.base_url}/api/tags")
+                response.raise_for_status()
+                data = response.json()
+        except Exception as exc:
+            return LLMHealth(
+                provider=self.name,
+                status="unhealthy",
+                model=self.configured_model,
+                details={"base_url": self.base_url, "error": str(exc)},
+            )
+
+        models = [
+            item.get("name", "")
+            for item in data.get("models", [])
+            if isinstance(item, dict)
+        ]
+        configured = self.configured_model
+        model_available = any(
+            model == configured or model.split(":", 1)[0] == configured
+            for model in models
+        )
+        return LLMHealth(
+            provider=self.name,
+            status="healthy" if model_available else "degraded",
+            model=configured,
+            details={
+                "base_url": self.base_url,
+                "model_available": model_available,
+                "available_models": models,
+            },
+        )
+
+    def _retry_count(self) -> int:
+        return max(1, int(getattr(self.settings, "llm_max_retries", 1) or 1))
+
+    async def _post_with_retries(self, client: httpx.AsyncClient, path: str, payload: dict) -> httpx.Response:
+        last_error: Exception | None = None
+        retryable_statuses = {408, 429, 500, 502, 503, 504}
+        for attempt in range(self._retry_count()):
+            try:
+                response = await client.post(f"{self.base_url}{path}", json=payload)
+                if response.status_code not in retryable_statuses:
+                    return response
+                response.raise_for_status()
+                return response
+            except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPStatusError) as exc:
+                last_error = exc
+                if attempt == self._retry_count() - 1:
+                    break
+                await asyncio.sleep(min(0.25 * (2**attempt), 2.0))
+
+        raise ExternalServiceError(
+            code=ErrorCode.LLM_TIMEOUT if isinstance(last_error, httpx.TimeoutException) else ErrorCode.LLM_PROVIDER_ERROR,
+            message="Ollama LLM service is unavailable",
+            user_message="The local LLM container is not ready yet. Please wait for Ollama to finish starting and pulling the model.",
+            details={"provider": self.name, "base_url": self.base_url, "model": payload.get("model"), "error": str(last_error)},
+        )
+
     async def generate(
         self,
         prompt: str,
@@ -174,8 +276,7 @@ class OllamaProvider:
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> LLMResult:
-        base_url = getattr(self.settings, "ollama_base_url", "http://localhost:11434")
-        ollama_model = model or getattr(self.settings, "ollama_model", "llama3")
+        ollama_model = model or self.configured_model
 
         messages = []
         for m in history:
@@ -206,20 +307,8 @@ class OllamaProvider:
             payload.setdefault("options", {})["num_predict"] = max_tokens
 
         async with httpx.AsyncClient(timeout=self.settings.llm_timeout_seconds) as client:
-            try:
-                response = await client.post(
-                    f"{base_url.rstrip('/')}/api/chat",
-                    json=payload,
-                )
-                if response.status_code == 404:
-                    raise httpx.HTTPStatusError(
-                        "Ollama /api/chat not found",
-                        request=response.request,
-                        response=response,
-                    )
-                response.raise_for_status()
-                data = response.json()
-            except httpx.HTTPStatusError:
+            response = await self._post_with_retries(client, "/api/chat", payload)
+            if response.status_code in {404, 405}:
                 # Fallback: /api/generate expects prompt, not messages.
                 prompt = "\n".join(m.get("content", "") for m in messages)
                 gen_payload: dict = {
@@ -232,20 +321,25 @@ class OllamaProvider:
                 if max_tokens is not None:
                     gen_payload.setdefault("options", {})["num_predict"] = max_tokens
 
-                response = await client.post(
-                    f"{base_url.rstrip('/')}/api/generate",
-                    json=gen_payload,
-                )
+                response = await self._post_with_retries(client, "/api/generate", gen_payload)
+                response.raise_for_status()
+                data = response.json()
+            else:
                 response.raise_for_status()
                 data = response.json()
 
 
-        # Ollama also supports "generate" API; if /api/chat is not available,
-        # this code path should be reached only when /api/chat returns success.
-        # Response format: {"message": {"role": "assistant", "content": "..."}, ...}
         content = (data.get("message") or {}).get("content")
         if not isinstance(content, str):
-            content = str(content or "")
+            content = data.get("response")
+        if not isinstance(content, str):
+            content = ""
+        if not content.strip():
+            raise ExternalServiceError(
+                message="Ollama returned an empty response",
+                user_message="The local LLM returned an empty answer. Please retry or verify the configured Ollama model.",
+                details={"provider": self.name, "model": ollama_model},
+            )
 
 
         return LLMResult(
@@ -253,6 +347,8 @@ class OllamaProvider:
             metadata={
                 "provider": self.name,
                 "model": data.get("model", ollama_model),
+                "done": data.get("done"),
+                "total_duration": data.get("total_duration"),
             },
         )
 
@@ -265,3 +361,7 @@ def create_llm_provider(settings: Settings):
         return OllamaProvider(settings)
     return LocalAssistantProvider()
 
+
+async def get_llm_health(settings: Settings) -> LLMHealth:
+    provider = create_llm_provider(settings)
+    return await provider.health_check()

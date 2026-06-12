@@ -323,6 +323,58 @@ async def shivaai_exception_handler(request: Request, exc: ShivaAIException) -> 
     )
 
 
+async def http_exception_handler(request: Request, exc: HTTPException) -> Response:
+    """Handle framework HTTPException responses with the standard envelope."""
+    request_id = str(uuid4())
+    message = str(exc.detail) if exc.detail else "HTTP error"
+    if exc.status_code == 404:
+        code = ErrorCode.RESOURCE_NOT_FOUND
+        severity = ErrorSeverity.INFO
+        user_message = "The requested resource was not found."
+    elif exc.status_code in {401, 403}:
+        code = ErrorCode.AUTH_INSUFFICIENT_PERMISSIONS
+        severity = ErrorSeverity.WARNING
+        user_message = message
+    elif exc.status_code == 409:
+        code = ErrorCode.RESOURCE_CONFLICT
+        severity = ErrorSeverity.WARNING
+        user_message = message
+    elif exc.status_code == 429:
+        code = ErrorCode.RATE_LIMIT_EXCEEDED
+        severity = ErrorSeverity.WARNING
+        user_message = message
+    else:
+        code = ErrorCode.INTERNAL_SERVER_ERROR if exc.status_code >= 500 else ErrorCode.VALIDATION_ERROR
+        severity = ErrorSeverity.ERROR if exc.status_code >= 500 else ErrorSeverity.WARNING
+        user_message = message
+
+    logger.info(
+        "HTTP exception",
+        error_code=code.value,
+        request_id=request_id,
+        path=request.url.path,
+        method=request.method,
+        status_code=exc.status_code,
+    )
+
+    response = ErrorResponse(
+        code=code.value,
+        message=message,
+        severity=severity.value,
+        request_id=request_id,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        status_code=exc.status_code,
+        user_message=user_message,
+    )
+
+    return Response(
+        content=response.model_dump_json(exclude_none=True),
+        status_code=exc.status_code,
+        media_type="application/json",
+        headers={"X-Request-ID": request_id},
+    )
+
+
 
 async def generic_exception_handler(request: Request, exc: Exception) -> Response:
     """Handle unexpected exceptions and convert to standardized errors."""

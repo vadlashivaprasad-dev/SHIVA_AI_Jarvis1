@@ -60,7 +60,6 @@ ignore = [
     "E501",   # line too long (handled by black)
     "B008",   # do not perform function calls in argument defaults
     "C901",   # function is too complex
-    "W503",   # line break before binary operator
 ]
 
 [tool.ruff.lint.isort]

@@ -15,7 +15,7 @@ services:
     environment:
       QDRANT_API_KEY: "qdrant_dev_key"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:6333/health > /dev/null || exit 1"]
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/6333'"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -30,6 +30,28 @@ services:
       - "11434:11434"
     volumes:
       - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      - shivaai-network
+
+  ollama-pull:
+    image: ollama/ollama:latest
+    container_name: shivaai-ollama-pull
+    environment:
+      OLLAMA_HOST: "http://ollama:11434"
+      OLLAMA_MODEL: "${OLLAMA_MODEL:-llama3.2:1b}"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ollama_data:/root/.ollama
+    entrypoint: ["/bin/sh", "-c"]
+    command: ['ollama pull "$${OLLAMA_MODEL}"']
     networks:
       - shivaai-network
 
@@ -46,13 +68,14 @@ services:
       # Enforce zero-cost, self-hosted LLM usage.
       QDRANT_URL: "http://qdrant:6333"
       JWT_SECRET: "dev-secret-key-change-in-prod"
-      DATABASE_PATH: "/app/data/gateway.db"
+      DATABASE_PATH: "/var/lib/shivaai/gateway.db"
 
       # Ollama-only policy (gateway should refuse paid providers).
       LLM_PROVIDER: "ollama"
       LLM_TIMEOUT_SECONDS: "45"
+      LLM_MAX_RETRIES: "3"
       OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://ollama:11434}"
-      OLLAMA_MODEL: "${OLLAMA_MODEL:-llama3}"
+      OLLAMA_MODEL: "${OLLAMA_MODEL:-llama3.2:1b}"
 
       # Keep keys unset/empty to prevent paid-provider usage.
       OPENAI_API_KEY: ""
@@ -61,19 +84,24 @@ services:
       LOG_LEVEL: "DEBUG"
       ENVIRONMENT: "development"
     depends_on:
-      - qdrant
+      qdrant:
+        condition: service_started
+      ollama:
+        condition: service_healthy
+      ollama-pull:
+        condition: service_completed_successfully
 
     volumes:
       - ./services/gateway:/app
+      - gateway_data:/var/lib/shivaai
 
     command: uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
     healthcheck:
-      test: >
-        CMD-SHELL
-        python - <<'PY'
-        import urllib.request
-        urllib.request.urlopen('http://localhost:8000/health').read()
-        PY
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/ready').read()\"",
+        ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -88,7 +116,8 @@ services:
     ports:
       - "3000:3000"
     environment:
-      VITE_API_URL: "http://localhost:8000"
+      VITE_API_URL: ""
+      VITE_PROXY_TARGET: "http://gateway:8000"
       VITE_WS_URL: "ws://localhost:8000"
     depends_on:
       - gateway
@@ -164,6 +193,7 @@ volumes:
   qdrant_data:
   prometheus_data:
   ollama_data:
+  gateway_data:
 
 
 

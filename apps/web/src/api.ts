@@ -4,6 +4,100 @@ import { useAppStore } from './store'
 const DEFAULT_API_URL = import.meta.env.VITE_API_URL || ''
 const API_URL = DEFAULT_API_URL.replace(/\/$/, '')
 
+function extractStreamText(value: unknown): string {
+  const textFromObject = (payload: unknown): string | null => {
+    if (typeof payload === 'string') return payload
+    if (!payload || typeof payload !== 'object') return null
+
+    const record = payload as { text?: unknown; content?: unknown; message?: unknown }
+    if (typeof record.text === 'string') return record.text
+    if (typeof record.content === 'string') return record.content
+    if (typeof record.message === 'string') return record.message
+    return null
+  }
+
+  if (typeof value !== 'string') {
+    const objectText = textFromObject(value)
+    return objectText === null ? '' : extractStreamText(objectText)
+  }
+
+  try {
+    const parsed = JSON.parse(value)
+    const parsedText = textFromObject(parsed)
+    if (parsedText !== null) return extractStreamText(parsedText)
+  } catch {
+    // Fall through to embedded JSON-object cleanup.
+  }
+
+  let output = ''
+  let cursor = 0
+  let foundEmbeddedPayload = false
+
+  while (cursor < value.length) {
+    const start = value.indexOf('{', cursor)
+    if (start === -1) {
+      output += value.slice(cursor)
+      break
+    }
+
+    output += value.slice(cursor, start)
+
+    let depth = 0
+    let inString = false
+    let escape = false
+    let end = -1
+
+    for (let index = start; index < value.length; index += 1) {
+      const char = value[index]
+
+      if (inString) {
+        if (escape) {
+          escape = false
+        } else if (char === '\\') {
+          escape = true
+        } else if (char === '"') {
+          inString = false
+        }
+        continue
+      }
+
+      if (char === '"') {
+        inString = true
+      } else if (char === '{') {
+        depth += 1
+      } else if (char === '}') {
+        depth -= 1
+        if (depth === 0) {
+          end = index
+          break
+        }
+      }
+    }
+
+    if (end === -1) {
+      output += value.slice(start)
+      break
+    }
+
+    const objectText = value.slice(start, end + 1)
+    try {
+      const text = textFromObject(JSON.parse(objectText))
+      if (text !== null) {
+        output += text
+        foundEmbeddedPayload = true
+      } else {
+        output += objectText
+      }
+    } catch {
+      output += objectText
+    }
+
+    cursor = end + 1
+  }
+
+  return foundEmbeddedPayload ? output : value
+}
+
 export interface ApiError {
   code: string
   message: string
@@ -15,7 +109,10 @@ export interface ApiError {
 
 export class ApiClient {
   private getHeaders(): HeadersInit {
-    const token = useAppStore.getState().token
+    const storeToken = useAppStore.getState().token
+    const legacyToken =
+      typeof window !== 'undefined' ? localStorage.getItem('shivaai_access_token') : null
+    const token = storeToken || legacyToken
     return {
       'Content-Type': 'application/json',
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
@@ -107,6 +204,9 @@ export class ApiClient {
 
       const decoder = new TextDecoder()
 
+      const contentType = response.headers.get('content-type') ?? ''
+      const isSseStream = contentType.toLowerCase().includes('text/event-stream')
+
       // SSE parsing buffer
       let sseBuffer = ''
 
@@ -126,7 +226,7 @@ export class ApiClient {
       }
 
       const parseSseFrame = (frame: string): { event?: string; data?: string } => {
-        const lines = frame.split('\n').map((l) => l.trimEnd())
+        const lines = frame.split('\n').map((l) => l.trimEnd().replace(/\r$/, ''))
         const eventLine = lines.find((l) => l.startsWith('event: '))
         const event = eventLine ? eventLine.slice(7).trim() : undefined
 
@@ -190,11 +290,9 @@ export class ApiClient {
 
           try {
             const parsed = JSON.parse(objStr)
-            const text = typeof parsed?.text === 'string' ? parsed.text : undefined
-            const content = typeof parsed?.content === 'string' ? parsed.content : undefined
+            const text = extractStreamText(parsed)
 
-            if (typeof text === 'string') onChunk(text)
-            else if (typeof content === 'string') onChunk(content)
+            if (text) onChunk(text)
           } catch {
             // Malformed JSON: stop extracting to avoid passing raw payload.
             // Keep remaining buffer as-is and wait for more data.
@@ -210,48 +308,45 @@ export class ApiClient {
 
         const incoming = decoder.decode(value, { stream: true })
 
-        // Update buffers
-        sseBuffer += incoming
-        jsonBuffer += incoming
+        if (isSseStream || incoming.includes('event:') || incoming.includes('data:')) {
+          sseBuffer += incoming
 
-        // SSE frames
-        tryExtractSseFrames((frame) => {
-          const { event, data } = parseSseFrame(frame)
-          if (!data) return
+          tryExtractSseFrames((frame) => {
+            const { event, data } = parseSseFrame(frame)
+            if (!data) return
 
-          // Stop marker
-          if (data.trim() === '[DONE]') return
+            // Stop marker
+            if (data.trim() === '[DONE]') return
 
-          if (event === 'error') {
-            onError(data)
-            return
-          }
+            if (event === 'error') {
+              onError(data)
+              return
+            }
 
-          if (event === 'token') {
+            if (event === 'done') {
+              return
+            }
+
+            if (event === 'token') {
+              const text = extractStreamText(data)
+              if (text) onChunk(text)
+              return
+            }
+
+            // Some backends may not send `event:` line, only data payload.
+            // Treat any JSON in `data` as token payload.
             try {
               const parsed = JSON.parse(data)
-              if (typeof parsed?.text === 'string') onChunk(parsed.text)
-              else if (typeof parsed?.content === 'string') onChunk(parsed.content)
-              else onChunk(data)
+              const text = extractStreamText(parsed)
+              if (text) onChunk(text)
             } catch {
-              onChunk(data)
+              // Ignore non-JSON SSE data to avoid showing raw wrappers.
             }
-            return
-          }
-
-          // Some backends may not send `event:` line, only data payload.
-          // Treat any JSON in `data` as token payload.
-          try {
-            const parsed = JSON.parse(data)
-            if (typeof parsed?.text === 'string') onChunk(parsed.text)
-            else if (typeof parsed?.content === 'string') onChunk(parsed.content)
-          } catch {
-            // Ignore non-JSON SSE data to avoid showing raw wrappers.
-          }
-        })
-
-        // Legacy raw JSON objects
-        tryExtractJsonObjects()
+          })
+        } else {
+          jsonBuffer += incoming
+          tryExtractJsonObjects()
+        }
 
         // If SSE stream used [DONE] sentinel without an event line, stop will be handled by server closing.
       }
