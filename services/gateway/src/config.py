@@ -14,7 +14,22 @@ class Settings(BaseSettings):
     # Environment and deployment
     environment: str = Field(default="development", alias="ENVIRONMENT")
     debug: bool = Field(default=False, alias="DEBUG")
-    
+    @field_validator("debug", mode="before")
+    @classmethod
+    def parse_debug(cls, v: object) -> bool:
+        """Treat invalid DEBUG strings as false instead of failing startup."""
+        if isinstance(v, bool):
+            return v
+        if v is None:
+            return False
+        if isinstance(v, str):
+            value = v.strip().lower()
+            if value in {"1", "true", "yes", "on", "debug"}:
+                return True
+            if value in {"0", "false", "no", "off", "release", "production", ""}:
+                return False
+        return bool(v)
+
     # Database configuration (PostgreSQL required for production)
     database_url: str = Field(
         default="sqlite:///./data/gateway.db", 

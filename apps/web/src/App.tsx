@@ -1,9 +1,4 @@
 import React, { useEffect, useRef, useState, type FormEvent } from 'react'
-import { useAppStore } from './store'
-import { AuthComponent } from './components/Auth'
-import { Sidebar } from './components/Sidebar'
-import { ChatComponent } from './components/Chat'
-import { apiClient } from './api'
 import type { HealthState } from './types'
 
 
@@ -183,6 +178,22 @@ function parseSseEvents(buffer: string) {
       .filter((event) => event.data.length > 0),
     remainder,
   }
+}
+
+function readableStreamText(data: string) {
+  if (!data) return ''
+
+  try {
+    const parsed = JSON.parse(data)
+    if (typeof parsed === 'string') return parsed
+    if (typeof parsed?.text === 'string') return parsed.text
+    if (typeof parsed?.content === 'string') return parsed.content
+    if (typeof parsed?.message === 'string') return parsed.message
+  } catch {
+    // Plain text token, already readable.
+  }
+
+  return data
 }
 
 function updateMessage(
@@ -984,10 +995,12 @@ export default function App() {
 
         for (const sseEvent of parsed.events) {
           if (sseEvent.eventType === 'token') {
+            const readableToken = readableStreamText(sseEvent.data)
+            if (!readableToken) continue
             setMessages((current) =>
               updateMessage(current, streamingMessageId, (message) => ({
                 ...message,
-                content: `${message.content}${sseEvent.data}`,
+                content: `${message.content}${readableToken}`,
               })),
             )
           }
@@ -1004,12 +1017,17 @@ export default function App() {
               assistantMessage = {
                 id: streamingMessageId,
                 role: 'assistant',
-                content: String(sseEvent.data ?? ''),
+                content: readableStreamText(String(sseEvent.data ?? '')),
               }
             }
 
-            if (typeof assistantMessage?.content === 'string' && assistantMessage.content.trim().length > 0) {
-              speak(assistantMessage.content)
+            const finalContent =
+              typeof assistantMessage?.content === 'string'
+                ? assistantMessage.content
+                : readableStreamText(sseEvent.data)
+
+            if (finalContent.trim().length > 0) {
+              speak(finalContent)
             }
 
             setMessages((current) =>
@@ -1017,10 +1035,14 @@ export default function App() {
                 ...message,
                 id: assistantMessage?.id ?? streamingMessageId,
                 role: 'assistant',
-                // Keep `message.content` built from token events.
+                content: message.content || finalContent,
                 isStreaming: false,
               })),
             )
+          }
+
+          if (sseEvent.eventType === 'error') {
+            throw new Error(readableStreamText(sseEvent.data) || 'Streaming failed')
           }
         }
       }
@@ -1037,14 +1059,14 @@ export default function App() {
       const detail = error instanceof Error ? error.message : 'Unknown gateway error'
       const errorMessage = `Gateway connection failed. ${detail}. Start the gateway with docker compose or uvicorn, then try again.`
       speak(errorMessage)
-      setMessages((current) => [
-        ...current.filter((message) => message.id !== streamingMessageId),
-        {
+      setMessages((current) =>
+        updateMessage(current, streamingMessageId, () => ({
           id: `error-${Date.now()}`,
           role: 'assistant',
           content: errorMessage,
-        },
-      ])
+          isStreaming: false,
+        })),
+      )
     } finally {
       setIsSending(false)
     }

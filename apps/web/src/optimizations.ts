@@ -118,7 +118,7 @@ export function debounce<T extends (...args: any[]) => any>(
   func: T,
   wait: number
 ): (...args: Parameters<T>) => void {
-  let timeout: NodeJS.Timeout
+  let timeout: ReturnType<typeof setTimeout>
   return function executedFunction(...args: Parameters<T>) {
     const later = () => {
       clearTimeout(timeout)
@@ -235,10 +235,27 @@ export class OptimizedApiClient {
   ): Promise<T> {
     const { timeout = this.defaultTimeout, retries = this.maxRetries, ...fetchOptions } = options
 
-    return this.retryWithBackoff(
+    const response = await this.retryWithBackoff(
       () => this.fetchWithTimeout(endpoint, fetchOptions, timeout),
       retries
     )
+
+    if (!response.ok) {
+      let message = `Request failed (${response.status})`
+      try {
+        const payload = await response.json()
+        message = payload.user_message || payload.message || payload.detail || message
+      } catch {
+        // Keep the status-based message when the body is not JSON.
+      }
+      throw new Error(message)
+    }
+
+    if (response.status === 204) {
+      return undefined as T
+    }
+
+    return (await response.json()) as T
   }
 
   private async fetchWithTimeout(
@@ -287,6 +304,7 @@ export class OptimizedApiClient {
     }
 
     const response = await this.request<T>(endpoint, { method: 'GET' })
+    this.requestCache.set(endpoint, { data: response, timestamp: Date.now() })
     return response
   }
 
