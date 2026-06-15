@@ -29,7 +29,6 @@ from .domain_services import (
     synthesize_voice_payload,
     transcribe_voice_payload,
     voice_sentiment_payload,
-    workflow_run_output,
 )
 from .errors import (
     ConflictError,
@@ -89,6 +88,7 @@ from .schemas import (
     WorldFactCreate,
 )
 from .storage import ChatRepository
+from .workflow_executor import execute_workflow
 
 
 def _now() -> str:
@@ -549,17 +549,21 @@ def create_app() -> FastAPI:
     @app.post("/api/v1/workflows", status_code=201)
     def create_workflow(body: WorkflowCreate, store: ChatRepository = Depends(repo)):
         now = _now()
+        metadata = dict(body.metadata)
+        if body.parallel_groups:
+            metadata["parallel_groups"] = body.parallel_groups
         return store.create_workflow(
             WorkflowEntry(
                 id=str(uuid4()),
                 name=body.name,
                 trigger=body.trigger,
                 steps=body.steps,
+                parallel_groups=body.parallel_groups,
                 status="enabled",
                 conditions=body.conditions,
                 schedule=body.schedule,
                 external_actions=body.external_actions,
-                metadata=body.metadata,
+                metadata=metadata,
                 created_at=now,
                 updated_at=now,
             )
@@ -575,7 +579,7 @@ def create_app() -> FastAPI:
         return store.list_workflows(query=query, status=status, limit=limit)
 
     @app.post("/api/v1/workflows/{workflow_id}/run")
-    def run_workflow(
+    async def run_workflow(
         workflow_id: str, body: dict[str, Any] | None = None, store: ChatRepository = Depends(repo)
     ):
         workflow = store.get_workflow(workflow_id)
@@ -583,7 +587,13 @@ def create_app() -> FastAPI:
             raise NotFoundError(message="Workflow not found")
         payload = body or {}
         dry_run = bool(payload.get("dry_run", True))
-        output = workflow_run_output(workflow, dry_run)
+        output = await execute_workflow(
+            workflow,
+            input_payload=payload.get("input", {}),
+            dry_run=dry_run,
+            repository=store,
+            parallel_groups=payload.get("parallel_groups"),
+        )
         now = _now()
         return store.create_workflow_run(
             WorkflowRunRecord(

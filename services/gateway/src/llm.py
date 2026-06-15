@@ -8,7 +8,6 @@ from .errors import ErrorCode, ExternalServiceError
 from .schemas import Message
 
 
-
 @dataclass
 class LLMResult:
     content: str
@@ -194,6 +193,8 @@ class OpenAICompatibleProvider:
 
 class OllamaProvider:
     name = "ollama"
+    default_num_predict = 256
+    max_interactive_timeout_seconds = 15.0
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -243,6 +244,33 @@ class OllamaProvider:
 
     def _retry_count(self) -> int:
         return max(1, int(getattr(self.settings, "llm_max_retries", 1) or 1))
+
+    async def _fallback_generate(
+        self,
+        prompt: str,
+        history: list[Message],
+        memories: list[str] | None,
+        model: str | None,
+        temperature: float | None,
+        max_tokens: int | None,
+        reason: str,
+    ) -> LLMResult:
+        fallback = LocalAssistantProvider()
+        result = await fallback.generate(prompt, history, memories, model, temperature, max_tokens)
+        result.metadata.update(
+            {
+                "provider": self.name,
+                "fallback_provider": fallback.name,
+                "provider_warning": reason,
+                "model": model or self.configured_model,
+            }
+        )
+        result.content = (
+            f"{result.content}\n\n"
+            "Note: The local Ollama model did not return in time, so I used the built-in "
+            "local assistant fallback for this response."
+        )
+        return result
 
     async def _post_with_retries(self, client: httpx.AsyncClient, path: str, payload: dict) -> httpx.Response:
         last_error: Exception | None = None
@@ -305,28 +333,54 @@ class OllamaProvider:
             payload["options"] = {"temperature": temperature}
         if max_tokens is not None:
             payload.setdefault("options", {})["num_predict"] = max_tokens
+        else:
+            payload.setdefault("options", {})["num_predict"] = self.default_num_predict
 
-        async with httpx.AsyncClient(timeout=self.settings.llm_timeout_seconds) as client:
-            response = await self._post_with_retries(client, "/api/chat", payload)
-            if response.status_code in {404, 405}:
-                # Fallback: /api/generate expects prompt, not messages.
-                prompt = "\n".join(m.get("content", "") for m in messages)
-                gen_payload: dict = {
-                    "model": ollama_model,
-                    "prompt": prompt,
-                    "stream": False,
-                }
-                if temperature is not None:
-                    gen_payload["options"] = {"temperature": temperature}
-                if max_tokens is not None:
-                    gen_payload.setdefault("options", {})["num_predict"] = max_tokens
+        try:
+            timeout = min(self.settings.llm_timeout_seconds, self.max_interactive_timeout_seconds)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await self._post_with_retries(client, "/api/chat", payload)
+                if response.status_code in {404, 405}:
+                    # Fallback: /api/generate expects prompt, not messages.
+                    prompt_text = "\n".join(m.get("content", "") for m in messages)
+                    gen_payload: dict = {
+                        "model": ollama_model,
+                        "prompt": prompt_text,
+                        "stream": False,
+                    }
+                    if temperature is not None:
+                        gen_payload["options"] = {"temperature": temperature}
+                    if max_tokens is not None:
+                        gen_payload.setdefault("options", {})["num_predict"] = max_tokens
+                    else:
+                        gen_payload.setdefault("options", {})["num_predict"] = self.default_num_predict
 
-                response = await self._post_with_retries(client, "/api/generate", gen_payload)
-                response.raise_for_status()
-                data = response.json()
-            else:
-                response.raise_for_status()
-                data = response.json()
+                    response = await self._post_with_retries(client, "/api/generate", gen_payload)
+                    response.raise_for_status()
+                    data = response.json()
+                else:
+                    response.raise_for_status()
+                    data = response.json()
+        except ExternalServiceError as exc:
+            return await self._fallback_generate(
+                prompt,
+                history,
+                memories,
+                model,
+                temperature,
+                max_tokens,
+                reason=exc.user_message,
+            )
+        except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPStatusError) as exc:
+            return await self._fallback_generate(
+                prompt,
+                history,
+                memories,
+                model,
+                temperature,
+                max_tokens,
+                reason=f"Ollama request failed: {exc}",
+            )
 
 
         content = (data.get("message") or {}).get("content")
@@ -335,10 +389,14 @@ class OllamaProvider:
         if not isinstance(content, str):
             content = ""
         if not content.strip():
-            raise ExternalServiceError(
-                message="Ollama returned an empty response",
-                user_message="The local LLM returned an empty answer. Please retry or verify the configured Ollama model.",
-                details={"provider": self.name, "model": ollama_model},
+            return await self._fallback_generate(
+                prompt,
+                history,
+                memories,
+                model,
+                temperature,
+                max_tokens,
+                reason="The local LLM returned an empty answer.",
             )
 
 

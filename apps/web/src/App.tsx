@@ -23,6 +23,7 @@ import type {
   UserPublic,
   WorkflowEntry,
   WorkflowRunRecord,
+  WorkflowRunOutput,
   WorkspaceTab,
 } from './types'
 
@@ -62,6 +63,7 @@ export default function App() {
   const [invocations, setInvocations] = useState<CapabilityInvocationRecord[]>([])
   const [workflows, setWorkflows] = useState<WorkflowEntry[]>([])
   const [workflowRuns, setWorkflowRuns] = useState<WorkflowRunRecord[]>([])
+  const [latestWorkflowRun, setLatestWorkflowRun] = useState<WorkflowRunRecord | null>(null)
   const [workflowName, setWorkflowName] = useState('')
   const [workflowSteps, setWorkflowSteps] = useState('')
   const [decisionText, setDecisionText] = useState('')
@@ -550,10 +552,24 @@ export default function App() {
     })
 
     if (response.ok) {
+      const run = (await response.json()) as WorkflowRunRecord
+      setLatestWorkflowRun(run)
       loadWorkflows()
       loadWorkflowRuns()
       loadEnterpriseOverview()
     }
+  }
+
+  function workflowFinalResponse(output?: WorkflowRunOutput) {
+    return output?.final_response || output?.merged_response?.final_response || ''
+  }
+
+  function workflowDomains(output?: WorkflowRunOutput) {
+    return output?.domain_awareness?.domains || output?.merged_response?.domains || []
+  }
+
+  function workflowKnowledgeCount(output?: WorkflowRunOutput) {
+    return output?.knowledge_used?.length || output?.merged_response?.knowledge_used?.length || 0
   }
 
   async function evaluateDecision() {
@@ -1530,6 +1546,22 @@ export default function App() {
             </div>
             <div className="invocation-list">
               <strong>Workflow runs</strong>
+              {latestWorkflowRun && (
+                <article>
+                  <span>{latestWorkflowRun.workflow_name}</span>
+                  <small>
+                    {latestWorkflowRun.dry_run ? 'preview' : latestWorkflowRun.status} -{' '}
+                    {latestWorkflowRun.output?.execution_mode ?? 'workflow'}
+                  </small>
+                  {workflowFinalResponse(latestWorkflowRun.output) && (
+                    <p>{workflowFinalResponse(latestWorkflowRun.output)}</p>
+                  )}
+                  <small>
+                    Domains: {workflowDomains(latestWorkflowRun.output).join(', ') || 'none'} - Knowledge:{' '}
+                    {workflowKnowledgeCount(latestWorkflowRun.output)}
+                  </small>
+                </article>
+              )}
               {workflowRuns.map((run) => (
                 <article key={run.id}>
                   <span>{run.workflow_name}</span>

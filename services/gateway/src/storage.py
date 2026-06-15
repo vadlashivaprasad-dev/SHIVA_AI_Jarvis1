@@ -1562,6 +1562,9 @@ class ChatRepository:
         return [self._capability_invocation_from_row(row) for row in rows]
 
     def create_workflow(self, workflow: WorkflowEntry) -> WorkflowEntry:
+        metadata = dict(workflow.metadata)
+        if workflow.parallel_groups:
+            metadata["parallel_groups"] = workflow.parallel_groups
         with self._lock, self._connect() as connection:
             connection.execute(
                 """
@@ -1580,7 +1583,7 @@ class ChatRepository:
                     json.dumps(workflow.conditions),
                     workflow.schedule,
                     json.dumps(workflow.external_actions),
-                    json.dumps(workflow.metadata),
+                    json.dumps(metadata),
                     workflow.created_at,
                     workflow.updated_at,
                     workflow.last_run_at,
@@ -1886,16 +1889,18 @@ class ChatRepository:
 
     @staticmethod
     def _workflow_from_row(row: sqlite3.Row) -> WorkflowEntry:
+        metadata = json.loads(row["metadata"] or "{}")
         return WorkflowEntry(
             id=row["id"],
             name=row["name"],
             trigger=row["trigger"],
             steps=json.loads(row["steps"] or "[]"),
+            parallel_groups=metadata.get("parallel_groups", []),
             status=row["status"],
             conditions=json.loads(row["conditions"] or "[]"),
             schedule=row["schedule"],
             external_actions=json.loads(row["external_actions"] or "[]"),
-            metadata=json.loads(row["metadata"] or "{}"),
+            metadata=metadata,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             last_run_at=row["last_run_at"],

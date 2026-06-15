@@ -77,8 +77,23 @@ export type WorkflowEntry = {
   name: string
   trigger: string
   steps: string[]
+  parallel_groups?: string[][]
   status: string
   last_run_at?: string
+}
+
+export type WorkflowRunOutput = {
+  execution_mode?: string
+  final_response?: string
+  domain_awareness?: {
+    domains?: string[]
+  }
+  knowledge_used?: Array<Record<string, unknown>>
+  merged_response?: {
+    final_response?: string
+    domains?: string[]
+    knowledge_used?: Array<Record<string, unknown>>
+  }
 }
 
 export type WorkflowRunRecord = {
@@ -87,6 +102,7 @@ export type WorkflowRunRecord = {
   status: string
   dry_run: boolean
   created_at: string
+  output?: WorkflowRunOutput
 }
 
 export type DecisionEvaluation = {

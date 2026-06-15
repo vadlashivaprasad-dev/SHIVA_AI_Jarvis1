@@ -494,6 +494,92 @@ def test_workflow_engine_foundation_create_run_and_history():
     assert verification_response.json()[0]["verdict"] == "pass"
 
 
+def test_workflow_parallel_agents_are_merged_into_one_response():
+    workflow_name = f"Parallel research {uuid4()}"
+    create_response = client.post(
+        "/api/v1/workflows",
+        json={
+            "name": workflow_name,
+            "trigger": "manual",
+            "steps": ["Research context", "Review risks", "Check tests", "Summarize answer"],
+            "parallel_groups": [["Research context", "Review risks", "Check tests"]],
+        },
+    )
+
+    assert create_response.status_code == 201
+    workflow = create_response.json()
+    assert workflow["parallel_groups"] == [["Research context", "Review risks", "Check tests"]]
+
+    run_response = client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        json={"dry_run": False, "input": {"objective": "Improve project performance"}},
+    )
+
+    assert run_response.status_code == 200
+    output = run_response.json()["output"]
+    assert output["execution_mode"] == "parallel"
+    assert output["merged_response"]["status"] == "completed"
+    assert output["merged_response"]["agent_count"] == 4
+    assert output["final_response"] == output["merged_response"]["final_response"]
+    assert "Research context processed" in output["final_response"]
+    assert "Review risks processed" in output["final_response"]
+    assert "Check tests processed" in output["final_response"]
+
+
+def test_workflow_parallel_agents_use_knowledge_and_domain_awareness():
+    client.patch(
+        "/api/v1/profile",
+        json={
+            "domains": ["coding", "automation"],
+            "preferences": {"workflow_context": "use stored project knowledge"},
+        },
+    )
+    client.post(
+        "/api/v1/memory",
+        json={
+            "content": "Parallel workflow agents should merge their findings into one final response.",
+            "category": "architecture",
+            "source": "test",
+        },
+    )
+    client.post(
+        "/api/v1/documents",
+        json={
+            "title": "Workflow performance notes",
+            "content": "Domain-aware workflow execution should use project knowledge, tests, and risk context.",
+            "source": "test-suite",
+            "tags": ["workflow", "performance"],
+            "add_to_memory": False,
+        },
+    )
+
+    create_response = client.post(
+        "/api/v1/workflows",
+        json={
+            "name": f"Domain aware workflow {uuid4()}",
+            "steps": ["Research project knowledge", "Review test risk", "Summarize response"],
+            "parallel_groups": [["Research project knowledge", "Review test risk"]],
+        },
+    )
+    workflow = create_response.json()
+
+    run_response = client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        json={
+            "dry_run": False,
+            "input": {"objective": "Improve parallel workflow performance with knowledge context"},
+        },
+    )
+
+    assert run_response.status_code == 200
+    output = run_response.json()["output"]
+    assert {"coding", "automation", "knowledge"} <= set(output["domain_awareness"]["domains"])
+    assert output["knowledge_used"]
+    assert any(item["type"] in {"memory", "document_chunk"} for item in output["knowledge_used"])
+    assert "domain context" in output["final_response"]
+    assert "knowledge reference" in output["final_response"]
+
+
 def test_decision_intelligence_and_reflection_foundations():
     decision_response = client.post(
         "/api/v1/decisions/evaluate",

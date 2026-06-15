@@ -237,6 +237,7 @@ class WorkflowCreate(BaseModel):
     name: str = Field(min_length=2, max_length=120)
     trigger: str = Field(default="manual", max_length=80)
     steps: list[str] = Field(min_length=1)
+    parallel_groups: list[list[str]] = Field(default_factory=list)
     conditions: list[str] = Field(default_factory=list)
     schedule: str | None = Field(default=None, max_length=120)
     external_actions: list[str] = Field(default_factory=list)
@@ -248,6 +249,7 @@ class WorkflowEntry(BaseModel):
     name: str
     trigger: str
     steps: list[str]
+    parallel_groups: list[list[str]] = Field(default_factory=list)
     status: str = "enabled"
     conditions: list[str] = Field(default_factory=list)
     schedule: str | None = None
